@@ -67,3 +67,16 @@ jobs:
           name: picks-${{ github.run_id }}
           path: output/*.csv
           retention-days: 14
+
+      - name: Check secrets presence (masked)
+        run: |
+          [ -n "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && echo "BOT_TOKEN: set" || echo "BOT_TOKEN: MISSING"
+          [ -n "${{ secrets.TELEGRAM_CHAT_ID }}" ]   && echo "CHAT_ID: set"   || echo "CHAT_ID: MISSING"
+
+      - name: (Test) send a Telegram ping
+        if: ${{ secrets.TELEGRAM_BOT_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != '' }}
+        run: |
+          curl -sS -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d text="✅ GitHub Actions: Telegram 測試成功（twas_KD）" \
+            -o /dev/null -w "HTTP %{http_code}\n"
