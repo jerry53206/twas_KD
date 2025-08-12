@@ -1,0 +1,69 @@
+name: TWSE KD Screener (Daily 15:00 TPE)
+
+on:
+  schedule:
+    - cron: "0 7 * * *"   # 每天 07:00 UTC = 台北 15:00
+  workflow_dispatch:       # 允許手動觸發
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Create .env for this run
+        run: |
+          cat > .env << 'EOF'
+          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+
+          # —— 參數（可依需求調整）——
+          TOP_N=20
+          KD_N=9
+          KD_K_SMOOTH=3
+          KD_D_PERIOD=3
+          KD_CROSS_WINDOW=3
+          KD_REQUIRE_ZONE=false
+          KD_ZONE_LOW=40
+          KD_ZONE_HIGH=80
+
+          VOLUME_LOOKBACK=20
+          VOLUME_MULTIPLIER=1.5
+
+          ENABLE_RULE_BLACK_CANDLE_LIMIT=true
+          BLACK_CANDLE_MAX_DROP=0.95
+          ENABLE_RULE_OC_ABOVE_MA20=true
+          ENABLE_RULE_LAST5_MA10_THRESHOLD=true
+          MAX_DAYS_BELOW_MA10_IN_5=3
+          ENABLE_RULE_MA5_GT_MA20=true
+
+          MARKET_CAP_MIN=10000000000
+          BATCH_SIZE=120
+          EOF
+
+      - name: Install dependencies
+        run: |
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install pandas numpy requests python-dotenv lxml
+          fi
+
+      - name: Run screener
+        run: python src/main.py
+
+      - name: Upload CSV artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: picks-${{ github.run_id }}
+          path: output/*.csv
+          retention-days: 14
