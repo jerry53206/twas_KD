@@ -106,16 +106,10 @@ def get_env_params():
 
 # --------- Universe ---------
 def build_universe(params) -> pd.DataFrame:
-    """
-    回傳欄位: code, name, yahoo
-    - TWSE: 加 .TW
-    - TPEX: 加 .TWO（當 INCLUDE_TPEX=true 時）
-    """
-    frames = []
-
-    twse = fetch_twse_listed_equities()
-    twse["yahoo"] = twse["code"].astype(str).str.zfill(4) + ".TW"
-    frames.append(twse[["code", "name", "yahoo"]])
+    df = fetch_twse_listed_equities()  # 會回 code, name, exchange
+    suf = df["exchange"].map({"TWSE": ".TW", "TPEX": ".TWO"}).fillna(".TW")
+    df["yahoo"] = df["code"].astype(str).str.zfill(4) + suf
+    return df[["code", "name", "exchange", "yahoo"]]
 
     if params.get("INCLUDE_TPEX", False):
         tpex = fetch_tpex_listed_equities()
