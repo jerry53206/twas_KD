@@ -9,6 +9,11 @@ jobs:
   run-screener:
     runs-on: ubuntu-latest
 
+    # 先把 GitHub Secrets 映射到 job 環境變數
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -19,12 +24,12 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      # 這一步會把 GitHub Secrets 寫進 .env（注意：EOF 沒有引號，才能展開）
+      # 這裡用 shell 展開 env（不是 ${{ secrets.* }} 了）
       - name: Create .env for this run
         run: |
           cat > .env << EOF
-          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+          TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 
           # —— 參數（可依需求調整）——
           TOP_N=20
@@ -58,7 +63,6 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            # 直接安裝需要的套件（含 yfinance）
             pip install pandas numpy requests python-dotenv lxml yfinance
           fi
 
@@ -73,17 +77,17 @@ jobs:
           path: output/*.csv
           retention-days: 14
 
-      # 顯示 Secrets 是否有配置（純檢查）
+      # 只做顯示，檢查 env 是否帶到
       - name: Check secrets presence (masked)
         run: |
-          [ -n "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && echo "BOT_TOKEN: set" || echo "BOT_TOKEN: MISSING"
-          [ -n "${{ secrets.TELEGRAM_CHAT_ID }}" ]   && echo "CHAT_ID: set"   || echo "CHAT_ID: MISSING"
+          [ -n "${TELEGRAM_BOT_TOKEN}" ] && echo "BOT_TOKEN: set" || echo "BOT_TOKEN: MISSING"
+          [ -n "${TELEGRAM_CHAT_ID}" ]   && echo "CHAT_ID: set"   || echo "CHAT_ID: MISSING"
 
-      #（可選）測試 Telegram ping
+      # ✅ 重點：用 env.* 在 if: 判斷，就不會報 "Unrecognized named-value: 'secrets'"
       - name: (Test) send a Telegram ping
-        if: ${{ secrets.TELEGRAM_BOT_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != '' }}
+        if: ${{ env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
         run: |
-          curl -sS -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
             -d text="✅ GitHub Actions: Telegram 測試成功（含上櫃 .TWO）" \
             -o /dev/null -w "HTTP %{http_code}\n"
