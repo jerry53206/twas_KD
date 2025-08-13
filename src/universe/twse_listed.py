@@ -48,3 +48,41 @@ def fetch_tpex_listed_equities() -> pd.DataFrame:
     df = df[~df["name"].astype(str).str.contains(pat, na=False)]
 
     return df[["code", "name"]].drop_duplicates("code").reset_index(drop=True)
+
+import os
+import pandas as pd
+
+# 若你已有新版的總表函式（例如 fetch_listed_universe），這裡用它做相容包裝
+try:
+    # 假設你現在的主函式叫這個（若名稱不同，就改成你的實名）
+    from .twse_listed import fetch_listed_universe  # 若本檔內已有定義，這行可刪
+except Exception:
+    pass
+
+def fetch_twse_listed_equities():
+    """
+    供 main.py 相容用。
+    回傳欄位至少含：code, name, yahoo
+    INCLUDE_TPEX=true 時，含上櫃，yahoo 後綴自動 .TW/.TWO
+    """
+    include_tpex = os.getenv("INCLUDE_TPEX", "false").lower() == "true"
+    # 若你的檔案裡已經有一個整合的函式，直接呼叫它（把名稱改成你的既有函式名）
+    if 'fetch_listed_universe' in globals():
+        df = fetch_listed_universe(include_tpex=include_tpex)
+    else:
+        # 如果你分成兩個函式，請把下列兩行替換成你的實名
+        df_twse = fetch_twse_only()      # ← 改成你的 TWSE 取數函式
+        if include_tpex:
+            df_tpex = fetch_tpex_only()  # ← 改成你的 TPEX 取數函式
+            df = pd.concat([df_twse, df_tpex], ignore_index=True)
+        else:
+            df = df_twse
+
+    # 保證有 yahoo 欄位
+    if "yahoo" not in df.columns:
+        if "exchange" in df.columns:
+            suf = df["exchange"].map({"TWSE": ".TW", "TPEX": ".TWO"}).fillna(".TW")
+            df["yahoo"] = df["code"].astype(str).str.zfill(4) + suf
+        else:
+            df["yahoo"] = df["code"].astype(str).str.zfill(4) + ".TW"
+    return df[["code", "name", "yahoo"]]
