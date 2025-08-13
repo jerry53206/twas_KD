@@ -1,18 +1,13 @@
-name: TWSE KD Screener (Daily 15:00 TPE)
+name: TWSE/TPEX KD Screener (Daily 15:00 TPE)
 
 on:
   schedule:
     - cron: "0 7 * * *"   # 每天 07:00 UTC = 台北 15:00
-  workflow_dispatch:
+  workflow_dispatch:       # 允許手動觸發
 
 jobs:
   run-screener:
     runs-on: ubuntu-latest
-
-    # 將 GitHub Secrets 映射到環境變數，供後續 steps 使用
-    env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
       - name: Checkout
@@ -24,25 +19,14 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Check secrets presence (masked)
-        run: |
-          [ -n "${TELEGRAM_BOT_TOKEN}" ] && echo "BOT_TOKEN: set" || echo "BOT_TOKEN: MISSING"
-          [ -n "${TELEGRAM_CHAT_ID}" ]   && echo "CHAT_ID: set"   || echo "CHAT_ID: MISSING"
-
-      - name: (Test) send a Telegram ping
-        if: ${{ env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
-        run: |
-          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-          -d chat_id="${TELEGRAM_CHAT_ID}" \
-          -d text="✅ GitHub Actions: Telegram 測試成功" \
-          -o /dev/null -w "HTTP %{http_code}\n"
-
-
+      # 這一步會把 GitHub Secrets 寫進 .env（注意：EOF 沒有引號，才能展開）
       - name: Create .env for this run
         run: |
           cat > .env << EOF
-          TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-          TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+
+          # —— 參數（可依需求調整）——
           TOP_N=20
           KD_N=9
           KD_K_SMOOTH=3
@@ -51,24 +35,30 @@ jobs:
           KD_REQUIRE_ZONE=false
           KD_ZONE_LOW=40
           KD_ZONE_HIGH=80
+
           VOLUME_LOOKBACK=20
           VOLUME_MULTIPLIER=1.5
+
           ENABLE_RULE_BLACK_CANDLE_LIMIT=true
           BLACK_CANDLE_MAX_DROP=0.95
           ENABLE_RULE_OC_ABOVE_MA20=true
           ENABLE_RULE_LAST5_MA10_THRESHOLD=true
           MAX_DAYS_BELOW_MA10_IN_5=3
           ENABLE_RULE_MA5_GT_MA20=true
+
           MARKET_CAP_MIN=10000000000
           BATCH_SIZE=120
+
+          # 納入上櫃
+          INCLUDE_TPEX=true
           EOF
-          echo ".env created."
 
       - name: Install dependencies
         run: |
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
+            # 直接安裝需要的套件（含 yfinance）
             pip install pandas numpy requests python-dotenv lxml yfinance
           fi
 
@@ -82,3 +72,18 @@ jobs:
           name: picks-${{ github.run_id }}
           path: output/*.csv
           retention-days: 14
+
+      # 顯示 Secrets 是否有配置（純檢查）
+      - name: Check secrets presence (masked)
+        run: |
+          [ -n "${{ secrets.TELEGRAM_BOT_TOKEN }}" ] && echo "BOT_TOKEN: set" || echo "BOT_TOKEN: MISSING"
+          [ -n "${{ secrets.TELEGRAM_CHAT_ID }}" ]   && echo "CHAT_ID: set"   || echo "CHAT_ID: MISSING"
+
+      #（可選）測試 Telegram ping
+      - name: (Test) send a Telegram ping
+        if: ${{ secrets.TELEGRAM_BOT_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != '' }}
+        run: |
+          curl -sS -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d text="✅ GitHub Actions: Telegram 測試成功（含上櫃 .TWO）" \
+            -o /dev/null -w "HTTP %{http_code}\n"
