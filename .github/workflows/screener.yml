@@ -3,16 +3,20 @@ name: TWSE/TPEX KD Screener (Daily 15:00 TPE)
 on:
   schedule:
     - cron: "0 7 * * *"   # 每天 07:00 UTC = 台北 15:00
-  workflow_dispatch:       # 允許手動觸發
+  workflow_dispatch: {}    # 允許手動觸發
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   run-screener:
     runs-on: ubuntu-latest
-
-    # 先把 GitHub Secrets 映射到 job 環境變數
     env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      TZ: Asia/Taipei
 
     steps:
       - name: Checkout
@@ -24,15 +28,18 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      # 這裡用 shell 展開 env（不是 ${{ secrets.* }} 了）
       - name: Create .env for this run
         run: |
-          cat > .env << EOF
-          TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-          TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+          cat > .env << 'EOF'
+          # ====== Secrets for Telegram (留空也可，程式會自動略過) ======
+          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
 
-          # —— 參數（可依需求調整）——
+          # ====== Screener Parameters ======
           TOP_N=20
+          FINAL_TOP=5
+
+          # KD
           KD_N=9
           KD_K_SMOOTH=3
           KD_D_PERIOD=3
@@ -41,9 +48,11 @@ jobs:
           KD_ZONE_LOW=40
           KD_ZONE_HIGH=80
 
+          # Volume
           VOLUME_LOOKBACK=20
           VOLUME_MULTIPLIER=1.5
 
+          # Candle/MA rules
           ENABLE_RULE_BLACK_CANDLE_LIMIT=true
           BLACK_CANDLE_MAX_DROP=0.95
           ENABLE_RULE_OC_ABOVE_MA20=true
@@ -51,15 +60,18 @@ jobs:
           MAX_DAYS_BELOW_MA10_IN_5=3
           ENABLE_RULE_MA5_GT_MA20=true
 
+          # Liquidity (新增)
+          MIN_LIQ_N=10
+          MIN_LIQ_SHARES=1000000
+
+          # Market cap / batching
           MARKET_CAP_MIN=10000000000
           BATCH_SIZE=120
-
-          # 納入上櫃
-          INCLUDE_TPEX=true
           EOF
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
@@ -77,17 +89,16 @@ jobs:
           path: output/*.csv
           retention-days: 14
 
-      # 只做顯示，檢查 env 是否帶到
-      - name: Check secrets presence (masked)
+      - name: Telegram ping (optional)
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          [ -n "${TELEGRAM_BOT_TOKEN}" ] && echo "BOT_TOKEN: set" || echo "BOT_TOKEN: MISSING"
-          [ -n "${TELEGRAM_CHAT_ID}" ]   && echo "CHAT_ID: set"   || echo "CHAT_ID: MISSING"
-
-      # ✅ 重點：用 env.* 在 if: 判斷，就不會報 "Unrecognized named-value: 'secrets'"
-      - name: (Test) send a Telegram ping
-        if: ${{ env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
-        run: |
-          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TELEGRAM_CHAT_ID}" \
-            -d text="✅ GitHub Actions: Telegram 測試成功（含上櫃 .TWO）" \
-            -o /dev/null -w "HTTP %{http_code}\n"
+          if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ]; then
+            curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              -d chat_id="${CHAT_ID}" \
+              -d text="✅ GitHub Actions：任務完成（CSV 已上傳到 artifacts）。" \
+              -o /dev/null || true
+          else
+            echo "Telegram secrets not set; skipping ping."
+          fi
