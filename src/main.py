@@ -63,6 +63,7 @@ def send_telegram_message(token: Optional[str], chat_id: Optional[str], text: st
 
 # --------- Parameters ---------
 def get_env_params():
+    # 從 repo 根目錄的 .env 讀取，Actions 會在前一步把 secrets 寫進這個檔案
     load_dotenv(ROOT / ".env", override=True)
     params = dict(
         KD_N=int(os.getenv("KD_N", "9")),
@@ -71,34 +72,35 @@ def get_env_params():
         KD_ZONE_LOW=float(os.getenv("KD_ZONE_LOW", "40")),
         KD_ZONE_HIGH=float(os.getenv("KD_ZONE_HIGH", "80")),
         KD_CROSS_WINDOW=int(os.getenv("KD_CROSS_WINDOW", "3")),
+        KD_REQUIRE_ZONE=os.getenv("KD_REQUIRE_ZONE", "false").lower() == "true",
+
         VOLUME_LOOKBACK=int(os.getenv("VOLUME_LOOKBACK", "20")),
         VOLUME_MULTIPLIER=float(os.getenv("VOLUME_MULTIPLIER", "1.5")),
 
-        # 是否納入上櫃
-        INCLUDE_TPEX=os.getenv("INCLUDE_TPEX", "true").lower() == "true",
-
-        MARKET_CAP_MIN=float(os.getenv("MARKET_CAP_MIN", "10000000000")),
-        BATCH_SIZE=int(os.getenv("BATCH_SIZE", "120")),
-
-        SMTP_HOST=os.getenv("SMTP_HOST"),
-        SMTP_PORT=int(os.getenv("SMTP_PORT", "587")),
-        SMTP_USE_TLS=os.getenv("SMTP_USE_TLS", "true").lower() == "true",
-        SMTP_USER=os.getenv("SMTP_USER"),
-        SMTP_PASS=os.getenv("SMTP_PASS"),
-        SENDER_EMAIL=os.getenv("SENDER_EMAIL"),
-        RECIPIENT_EMAIL=os.getenv("RECIPIENT_EMAIL"),
-
-        # Telegram（若你有）
-        TELEGRAM_BOT_TOKEN=8446565667:AAGe1XjHxPppkTFq859zn1Vjkx5jrRdRRng("TELEGRAM_BOT_TOKEN"),
-        TELEGRAM_CHAT_ID=6247286180("TELEGRAM_CHAT_ID"),
-
-        TOP_N=int(os.getenv("TOP_N", "20")),
         ENABLE_RULE_BLACK_CANDLE_LIMIT=os.getenv("ENABLE_RULE_BLACK_CANDLE_LIMIT", "true").lower() == "true",
         BLACK_CANDLE_MAX_DROP=float(os.getenv("BLACK_CANDLE_MAX_DROP", "0.95")),
         ENABLE_RULE_OC_ABOVE_MA20=os.getenv("ENABLE_RULE_OC_ABOVE_MA20", "true").lower() == "true",
         ENABLE_RULE_LAST5_MA10_THRESHOLD=os.getenv("ENABLE_RULE_LAST5_MA10_THRESHOLD", "true").lower() == "true",
         MAX_DAYS_BELOW_MA10_IN_5=int(os.getenv("MAX_DAYS_BELOW_MA10_IN_5", "3")),
         ENABLE_RULE_MA5_GT_MA20=os.getenv("ENABLE_RULE_MA5_GT_MA20", "true").lower() == "true",
+
+        MARKET_CAP_MIN=float(os.getenv("MARKET_CAP_MIN", "10000000000")),
+        BATCH_SIZE=int(os.getenv("BATCH_SIZE", "120")),
+        TOP_N=int(os.getenv("TOP_N", "20")),
+        INCLUDE_TPEX=os.getenv("INCLUDE_TPEX", "false").lower() == "true",
+
+        # ✅ 從環境變數讀，不要把 token/ID 寫死在程式裡
+        TELEGRAM_BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN", ""),
+        TELEGRAM_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID", ""),
+
+        # 若你還保留 Email，可一併讀進來（沒有就留空）
+        SMTP_HOST=os.getenv("SMTP_HOST", ""),
+        SMTP_PORT=int(os.getenv("SMTP_PORT", "587")),
+        SMTP_USE_TLS=os.getenv("SMTP_USE_TLS", "true").lower() == "true",
+        SMTP_USER=os.getenv("SMTP_USER", ""),
+        SMTP_PASS=os.getenv("SMTP_PASS", ""),
+        SENDER_EMAIL=os.getenv("SENDER_EMAIL", ""),
+        RECIPIENT_EMAIL=os.getenv("RECIPIENT_EMAIL", ""),
     )
     return params
 
