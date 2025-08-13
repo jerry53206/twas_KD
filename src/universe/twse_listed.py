@@ -1,109 +1,101 @@
 # src/universe/twse_listed.py
-import os
 import re
+import time
 from io import StringIO
-from typing import Optional
+from typing import Literal
 
-import pandas as pd
 import requests
+import pandas as pd
 
-TWSE_ISIN_URL = "https://isin.twse.com.tw/isin/C_public.jsp"
+TWSE_ISIN_URL = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2"  # 上市
+TPEX_ISIN_URL = "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4"  # 上櫃
 
-# 排除的種類／名稱關鍵字（盡量只保留普通股）
-EXCLUDE_INDUSTRY = {
-    "ETF", "ETN", "受益證券", "封閉式基金", "指數投資證券", "債券", "證券投資信託"
-}
-EXCLUDE_NAME_REGEX = re.compile(
-    r"(特別股|受益|權證|牛熊|認購|認售|WARRANT|公司債|可轉債|存託憑證)", re.IGNORECASE
+# 排除：ETF/ETN/基金/受益憑證/債/權證/牛熊/特別股/存託憑證/DR…（不分大小寫）
+_EXCLUDE_RE = re.compile(
+    r"(?:ETF|ETN|基金|受益|受益憑證|債|公司債|可轉債|轉換|購|售|權證|認購|認售|牛|熊|特別股|優先股|存託憑證|DR)",
+    re.IGNORECASE,
 )
 
+def _http_get(url: str, retries: int = 3, sleep: float = 0.6) -> str:
+    last_err = None
+    for _ in range(retries):
+        try:
+            r = requests.get(url, timeout=20)
+            if r.ok:
+                return r.text
+            last_err = RuntimeError(f"HTTP {r.status_code}")
+        except Exception as e:
+            last_err = e
+        time.sleep(sleep)
+    raise RuntimeError(f"GET failed: {url} ({last_err})")
 
-def _fetch_isin_table(str_mode: int) -> pd.DataFrame:
-    """
-    讀取 TWSE ISIN 公開頁面：上市=2，上櫃=4
-    """
-    r = requests.get(TWSE_ISIN_URL, params={"strMode": str_mode}, timeout=30)
-    # 該頁面為中文編碼（常見 cp950/big5），手動指定比較穩定
-    r.encoding = "cp950"
-    tables = pd.read_html(StringIO(r.text))
-    # 選第一個含有 ISIN 欄位的表
-    for t in tables:
-        if any("ISIN" in str(c) for c in t.columns):
-            return t
-    # 退而求其次：回傳第一個表
-    return tables[0]
+def _read_isin_table(html: str) -> pd.DataFrame:
+    # 用 lxml 解析；若表頭不在 columns，就把第 1 列提升為表頭
+    tables = pd.read_html(StringIO(html), flavor="lxml")
+    if not tables:
+        raise RuntimeError("ISIN 頁面未解析出表格。")
+    df = tables[0]
+    if not any(isinstance(c, str) and ("有價" in c or "ISIN" in c or "證券" in c) for c in df.columns):
+        header = df.iloc[0].astype(str).tolist()
+        df = df.iloc[1:].copy()
+        df.columns = header
+    df = df.dropna(how="all", axis=0).dropna(how="all", axis=1)
+    return df
 
-
-def _parse_isin_equities(raw: pd.DataFrame, exchange: str) -> pd.DataFrame:
-    """
-    從 ISIN 表格中萃取普通股清單，回傳欄位：code, name, exchange
-    """
-    def find_col(keyword: str) -> Optional[str]:
-        for c in raw.columns:
-            sc = str(c)
-            if keyword in sc:
+def _pick_column(colnames, keywords):
+    """在多種候選欄名中做模糊比對（去空白、包含關鍵字即命中）"""
+    def norm(s: str) -> str:
+        return re.sub(r"\s+", "", str(s))
+    for c in colnames:
+        nc = norm(c)
+        for k in keywords:
+            if k in nc:
                 return c
-        return None
+    return None
 
-    col_cn = find_col("代號") or find_col("名稱")
-    col_isin = find_col("ISIN")
-    col_ind = find_col("產業")
+def _parse_isin_equities(df: pd.DataFrame, exchange: Literal["TWSE", "TPEX"]) -> pd.DataFrame:
+    cols = list(df.columns)
 
-    if col_cn is None:
-        raise RuntimeError("ISIN 表格結構可能變動，找不到『有價證券代號及名稱』欄。")
+    # 可能的欄名：合併欄 or 拆開欄
+    code_name_col = _pick_column(cols, ["有價證券代號及名稱"])
+    code_col = _pick_column(cols, ["有價證券代號", "證券代號", "股票代號", "代號"])
+    name_col = _pick_column(cols, ["有價證券名稱", "證券名稱", "股票名稱", "名稱"])
 
-    df = raw.copy()
+    if code_name_col is not None:
+        s = df[code_name_col].astype(str)
+        m = s.str.extract(r"^\s*(\d{4})\s*(.+)$")
+        m.columns = ["code", "name"]
+        out = m.dropna()
+    elif code_col is not None and name_col is not None:
+        out = df[[code_col, name_col]].copy()
+        out.columns = ["code", "name"]
+        out["code"] = out["code"].astype(str).str.extract(r"(\d{4})")[0]
+        out = out.dropna(subset=["code", "name"])
+    else:
+        # 萬一表頭再變形，用前兩欄做最後嘗試
+        tmp = df.iloc[:, :2].copy()
+        tmp.columns = ["code", "name"]
+        tmp["code"] = tmp["code"].astype(str).str.extract(r"(\d{4})")[0]
+        out = tmp.dropna(subset=["code", "name"])
 
-    # 去掉分類列（例如「股票」小節標題等），通常這些列的 ISIN 會是 NaN
-    if col_isin in df.columns:
-        df = df[df[col_isin].notna()]
-
-    # 拆出代號與名稱：格式多為「2330  台積電」
-    cn = df[col_cn].astype(str).str.strip()
-    m = cn.str.extract(r"^(?P<code>\d{4})\s+(?P<name>.+)$")
-
-    df = df.loc[m.index].copy()
-    df["code"] = m["code"]
-    df["name"] = m["name"].str.strip()
-
-    # 只收 4 碼數字代號（普通股），排除權證/特別股等（通常非純數字或非 4 碼）
-    df = df[df["code"].str.fullmatch(r"\d{4}")]
-
-    # 排除非普通股（ETF 等），以及名稱關鍵字
-    if col_ind in df.columns:
-        df = df[~df[col_ind].astype(str).isin(EXCLUDE_INDUSTRY)]
-    df = df[~df["name"].str.contains(EXCLUDE_NAME_REGEX)]
-
-    df["exchange"] = exchange
-    return df[["code", "name", "exchange"]].drop_duplicates().reset_index(drop=True)
-
-
-def fetch_twse_only() -> pd.DataFrame:
-    raw = _fetch_isin_table(2)  # 上市
-    return _parse_isin_equities(raw, "TWSE")
-
-
-def fetch_tpex_only() -> pd.DataFrame:
-    raw = _fetch_isin_table(4)  # 上櫃
-    return _parse_isin_equities(raw, "TPEX")
-
+    # 僅保留 4 碼股票代號；名稱過濾不需要的商品
+    out = out[out["code"].str.fullmatch(r"\d{4}")]
+    out = out[~out["name"].astype(str).str.contains(_EXCLUDE_RE)]
+    out["name"] = out["name"].astype(str).str.strip()
+    out = out.drop_duplicates(subset=["code"]).reset_index(drop=True)
+    out["exchange"] = exchange
+    if out.empty:
+        raise RuntimeError("ISIN 表格結構可能變動，解析後為空。")
+    return out[["code", "name", "exchange"]]
 
 def fetch_twse_listed_equities() -> pd.DataFrame:
-    """
-    供 main.py 相容：讀取上市；若環境變數 INCLUDE_TPEX=true，則連同上櫃一起回傳。
-    回傳至少包含欄位：code, name, exchange
-    """
-    include_tpex = os.getenv("INCLUDE_TPEX", "false").lower() == "true"
+    """回傳（上市＋上櫃）普通股清單：columns = code, name, exchange"""
+    tw_html = _http_get(TWSE_ISIN_URL)
+    tw_df = _read_isin_table(tw_html)
+    twse = _parse_isin_equities(tw_df, "TWSE")
 
-    df_twse = fetch_twse_only()
-    if include_tpex:
-        try:
-            df_tpex = fetch_tpex_only()
-            df = pd.concat([df_twse, df_tpex], ignore_index=True)
-        except Exception:
-            # 若 TPEX 讀取失敗，就先提供 TWSE
-            df = df_twse
-    else:
-        df = df_twse
+    tp_html = _http_get(TPEX_ISIN_URL)
+    tp_df = _read_isin_table(tp_html)
+    tpex = _parse_isin_equities(tp_df, "TPEX")
 
-    return df
+    return pd.concat([twse, tpex], ignore_index=True)
