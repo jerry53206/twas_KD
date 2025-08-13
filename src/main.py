@@ -106,7 +106,7 @@ def get_env_params():
 
 # --------- Universe ---------
 def build_universe(params) -> pd.DataFrame:
-    df = fetch_twse_listed_equities()  # 會回 code, name, exchange
+    df = fetch_twse_listed_equities()  # 回傳 code,name,exchange
     suf = df["exchange"].map({"TWSE": ".TW", "TPEX": ".TWO"}).fillna(".TW")
     df["yahoo"] = df["code"].astype(str).str.zfill(4) + suf
     return df[["code", "name", "exchange", "yahoo"]]
