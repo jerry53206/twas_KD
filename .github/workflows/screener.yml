@@ -1,22 +1,25 @@
-name: TWSE/TPEX KD Screener (13:40 TPE)
+name: TWSE KD Screener (Daily 13:40 TPE)
+
+# 允許把 history/ 檔案推回 repo
+permissions:
+  contents: write
 
 on:
   schedule:
-    - cron: "40 5 * * 1-5"   # 台北 13:40（UTC+8）
+    # 台北 UTC+8，13:40 => 05:40 UTC；僅週一~週五
+    - cron: "40 5 * * 1-5"
   workflow_dispatch:
 
 jobs:
   run-screener:
     runs-on: ubuntu-latest
 
-    # 將 secrets 映射成環境變數，步驟裡只用 env.*
-    env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # 需要完整歷史，push 才不會出問題
+          persist-credentials: true # 用 GITHUB_TOKEN 推回來
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -25,14 +28,16 @@ jobs:
           cache: "pip"
 
       - name: Create .env for this run
+        # 這裡把 Telegram 的 secrets 寫進 .env（若你沒設，會是空字串，程式內會自動跳過發送）
         run: |
           cat > .env << 'EOF'
-          # ===== 通知 =====
-          TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-          TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+          # === 通知設定 ===
+          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
 
-          # ===== 參數（可依需求調整）=====
+          # === 參數（可依需求調整）===
           TOP_N=20
+
           KD_N=9
           KD_K_SMOOTH=3
           KD_D_PERIOD=3
@@ -44,6 +49,7 @@ jobs:
           VOLUME_LOOKBACK=20
           VOLUME_MULTIPLIER=1.5
 
+          # 規則開關
           ENABLE_RULE_BLACK_CANDLE_LIMIT=true
           BLACK_CANDLE_MAX_DROP=0.95
           ENABLE_RULE_OC_ABOVE_MA20=true
@@ -51,16 +57,25 @@ jobs:
           MAX_DAYS_BELOW_MA10_IN_5=3
           ENABLE_RULE_MA5_GT_MA20=true
 
+          # 流通性門檻（最近10日每日至少百萬股）
+          LIQ_10D_EACH_MIN=1000000
+
+          # 市值門檻
           MARKET_CAP_MIN=10000000000
+
+          # Yahoo 下載批次大小
           BATCH_SIZE=120
           EOF
+          echo "Generated .env:"
+          sed 's/^\(TELEGRAM_.*=\).*/\1****/g' .env | sed 's/^\(SMTP_.*=\).*/\1****/g'
 
       - name: Install dependencies
         run: |
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install pandas numpy requests python-dotenv lxml yfinance pytz
+            # 備用：若沒有 requirements.txt 就裝常用套件
+            pip install pandas numpy requests python-dotenv lxml yfinance
           fi
 
       - name: Run screener
@@ -71,15 +86,32 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: picks-${{ github.run_id }}
-          path: output/*.csv
+          path: |
+            output/*.csv
           retention-days: 14
 
-      - name: (Optional) Telegram ping (no secrets in if)
+      - name: Save & commit today's picks into repo history
+        if: always()
         run: |
-          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
-            curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-              -d chat_id="${TELEGRAM_CHAT_ID}" \
-              -d text="✅ Workflow 執行完畢（twas_KD）" >/dev/null || true
+          set -e
+          DATE_TPE=$(TZ=Asia/Taipei date +%Y%m%d)
+          mkdir -p history
+
+          # 優先找當日檔名；沒有就用最新一個
+          if [ -f "output/picks_${DATE_TPE}.csv" ]; then
+            SRC="output/picks_${DATE_TPE}.csv"
           else
-            echo "Telegram secrets not set; skip ping."
+            SRC=$(ls -t output/picks_*.csv 2>/dev/null | head -n1 || true)
+          fi
+
+          if [ -n "$SRC" ] && [ -f "$SRC" ]; then
+            cp -f "$SRC" "history/picks_${DATE_TPE}.csv"
+
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add "history/picks_${DATE_TPE}.csv"
+            git commit -m "history: update ${DATE_TPE}" || echo "Nothing to commit"
+            git push
+          else
+            echo "No picks CSV found to archive. Skip committing history."
           fi
