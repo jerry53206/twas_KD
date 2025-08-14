@@ -157,6 +157,19 @@ def volume_today_over_prevN(volume: pd.Series, lookback: int, multiplier: float)
     ratio = v_today / v_avg
     return (ratio >= multiplier), ratio, v_today, v_avg
 
+def volume_over_prevN_at_index(volume: pd.Series, i: int, lookback: int, multiplier: float) -> Tuple[bool, float]:
+    """
+    第 i 根的量 / 其前 N 根均量 >= multiplier
+    回傳 (bool, ratio_i)
+    """
+    if i < lookback:
+        return False, np.nan
+    v_i = float(volume.iloc[i])
+    v_avg = float(volume.iloc[i - lookback:i].mean())
+    if v_avg <= 0 or np.isnan(v_i) or np.isnan(v_avg):
+        return False, np.nan
+    return (v_i / v_avg >= multiplier), (v_i / v_avg)
+
 def last_n_all_volume_at_least(volume: pd.Series, n: int, min_shares: int) -> bool:
     """最近 n 根每根量都 >= min_shares"""
     if len(volume) < n:
@@ -166,10 +179,90 @@ def last_n_all_volume_at_least(volume: pd.Series, n: int, min_shares: int) -> bo
         return False
     return bool((tail >= min_shares).all())
 
+def last_n_all_volume_at_least_at_index(volume: pd.Series, i: int, n: int, min_shares: int) -> bool:
+    """第 i 根往回 n 根內，每根量都 >= min_shares"""
+    if i < n - 1:
+        return False
+    window = volume.iloc[i - (n - 1): i + 1]
+    if window.isna().any():
+        return False
+    return bool((window >= min_shares).all())
+
 def moving_averages(close: pd.Series) -> Tuple[pd.Series, pd.Series, pd.Series]:
     return close.rolling(5).mean(), close.rolling(10).mean(), close.rolling(20).mean()
 
-# --------------- 單檔訊號與規則檢查 ---------------
+# --------------- 逐日規則檢查（供連續天數演算法使用） ---------------
+def passes_all_rules_at_index(
+    df: pd.DataFrame,
+    i: int,
+    params: Dict,
+    K: pd.Series,
+    D: pd.Series,
+    ma5: pd.Series,
+    ma10: pd.Series,
+    ma20: pd.Series,
+) -> bool:
+    """
+    檢查「第 i 根」是否滿足所有（技術/價量/MA/黑K/流動性）規則。
+    注意：此處不檢查市值（市值只以當天過濾）。
+    """
+    # K/D 可用性
+    if i <= 0 or np.isnan(K.iloc[i]) or np.isnan(D.iloc[i]):
+        return False
+
+    # KD 黃金交叉在近 window 內，且當下 K > D；（可選擇 zone 限制）
+    cross_idx = golden_cross_in_last_n(
+        K[:i+1], D[:i+1],
+        window=params["KD_CROSS_WINDOW"],
+        require_zone=params["KD_REQUIRE_ZONE"],
+        zone_low=params["KD_ZONE_LOW"],
+        zone_high=params["KD_ZONE_HIGH"],
+    )
+    if cross_idx is None or not (K.iloc[i] > D.iloc[i]):
+        return False
+
+    # MA 可用性
+    if np.isnan(ma5.iloc[i]) or np.isnan(ma10.iloc[i]) or np.isnan(ma20.iloc[i]):
+        return False
+
+    # MA5 > MA20
+    if params["ENABLE_RULE_MA5_GT_MA20"] and not (ma5.iloc[i] > ma20.iloc[i]):
+        return False
+
+    # 開盤或收盤其一 >= MA20
+    o, c = float(df["Open"].iloc[i]), float(df["Close"].iloc[i])
+    if params["ENABLE_RULE_OC_ABOVE_MA20"] and not ((o >= ma20.iloc[i]) or (c >= ma20.iloc[i])):
+        return False
+
+    # 最近 5 日（以 i 為截止）收盤 < MA10 的天數 <= 門檻
+    if params["ENABLE_RULE_LAST5_MA10_THRESHOLD"]:
+        if i < 4:
+            return False
+        last5_close = df["Close"].iloc[i-4:i+1]
+        last5_ma10 = ma10.iloc[i-4:i+1]
+        days_below = int((last5_close < last5_ma10).sum())
+        if days_below > params["MAX_DAYS_BELOW_MA10_IN_5"]:
+            return False
+
+    # 黑Ｋ限制
+    if params["ENABLE_RULE_BLACK_CANDLE_LIMIT"] and (c < o):
+        if c < o * params["BLACK_CANDLE_MAX_DROP"]:
+            return False
+
+    # 量能：當日量 / 前 N 日均量 >= 倍數
+    ok_vol_i, _ratio_i = volume_over_prevN_at_index(
+        df["Volume"], i, params["VOLUME_LOOKBACK"], params["VOLUME_MULTIPLIER"]
+    )
+    if not ok_vol_i:
+        return False
+
+    # 近 10 日逐日量下限
+    if not last_n_all_volume_at_least_at_index(df["Volume"], i, 10, params["MIN_VOL_10D"]):
+        return False
+
+    return True
+
+# --------------- 單檔訊號與規則檢查（當日 + 連續天數） ---------------
 def evaluate_signals_for_ticker(
     df: pd.DataFrame,
     params: Dict,
@@ -181,14 +274,15 @@ def evaluate_signals_for_ticker(
     - Liquidity：近 10 日逐日量皆 >= MIN_VOL_10D
     - 趨勢：MA5>MA20；(Open>=MA20 or Close>=MA20)；最近 5 日收盤低於 MA10 的天數 <= 阈值
     - 黑Ｋ限制：若 Close<Open，則 Close >= Open * BLACK_CANDLE_MAX_DROP
-    通過者回傳指標與後續排名所需資料。
+    通過者回傳指標與後續排名所需資料；同時計算「連續天數 streak_days」。
     """
     if df is None or df.empty:
         return None
-    if set(["Open", "High", "Low", "Close", "Volume"]) - set(df.columns):
+    need_cols = {"Open", "High", "Low", "Close", "Volume"}
+    if not need_cols.issubset(set(df.columns)):
         return None
 
-    # 歷史長度檢查（KD 與 MA、量能）
+    # 歷史長度檢查
     min_hist = max(
         60,
         params["VOLUME_LOOKBACK"] + 10,
@@ -197,11 +291,10 @@ def evaluate_signals_for_ticker(
     if len(df) < min_hist:
         return None
 
-    # 移除全零量/全 NaN
     if df["Volume"].fillna(0).sum() <= 0:
         return None
 
-    # ---- 計算 KD ----
+    # ---- 計算 KD 與 MA ----
     K, D = stochastic_kd(
         df["High"], df["Low"], df["Close"],
         n=params["KD_N"],
@@ -211,9 +304,39 @@ def evaluate_signals_for_ticker(
     if K is None or D is None or len(K) != len(df) or len(D) != len(df):
         return None
 
-    k_last, d_last = float(K.iloc[-1]), float(D.iloc[-1])
+    ma5, ma10, ma20 = moving_averages(df["Close"])
 
-    # 近 window 日內是否發生黃金交叉（且可選擇是否需在區間）
+    i_last = len(df) - 1
+
+    # 先檢查「當日」是否過濾成功
+    if not passes_all_rules_at_index(df, i_last, params, K, D, ma5, ma10, ma20):
+        return None
+
+    # 計算今日用的量能比（給輸出）
+    ok_vol, vol_ratio, v_today, v_avg = volume_today_over_prevN(
+        df["Volume"], params["VOLUME_LOOKBACK"], params["VOLUME_MULTIPLIER"]
+    )
+    if not ok_vol:
+        return None
+
+    # 連續天數：由當天往回逐日檢查
+    streak = 0
+    # 最多回溯 60 天，避免無限迴圈
+    for i in range(i_last, max(-1, i_last - 60), -1):
+        if passes_all_rules_at_index(df, i, params, K, D, ma5, ma10, ma20):
+            streak += 1
+        else:
+            break
+
+    # 準備輸出欄位
+    k_last = float(K.iloc[i_last])
+    d_last = float(D.iloc[i_last])
+    close_last = float(df["Close"].iloc[i_last])
+    open_last = float(df["Open"].iloc[i_last])
+    ma20_last = float(ma20.iloc[i_last])
+    kd_spread = k_last - d_last
+    trend_strength = (close_last - ma20_last) / ma20_last if ma20_last > 0 else np.nan
+
     cross_idx = golden_cross_in_last_n(
         K, D,
         window=params["KD_CROSS_WINDOW"],
@@ -221,61 +344,9 @@ def evaluate_signals_for_ticker(
         zone_low=params["KD_ZONE_LOW"],
         zone_high=params["KD_ZONE_HIGH"],
     )
-    if cross_idx is None:
-        return None
-
-    # 當下 K 必須 > D
-    if not (k_last > d_last):
-        return None
-
-    # ---- MA 計算與規則 ----
-    ma5, ma10, ma20 = moving_averages(df["Close"])
-    ma5_last = float(ma5.iloc[-1])
-    ma10_last = float(ma10.iloc[-1])
-    ma20_last = float(ma20.iloc[-1])
-    close_last = float(df["Close"].iloc[-1])
-    open_last = float(df["Open"].iloc[-1])
-
-    # MA5 > MA20
-    if params["ENABLE_RULE_MA5_GT_MA20"] and not (ma5_last > ma20_last):
-        return None
-
-    # 開盤或收盤其一不可低於 MA20（等同於 open>=MA20 or close>=MA20）
-    if params["ENABLE_RULE_OC_ABOVE_MA20"] and not ((open_last >= ma20_last) or (close_last >= ma20_last)):
-        return None
-
-    # 最近 5 日，收盤 < MA10 的天數 <= 阈值
-    if params["ENABLE_RULE_LAST5_MA10_THRESHOLD"]:
-        last5 = df["Close"].iloc[-5:]
-        last5_ma10 = ma10.iloc[-5:]
-        days_below = int((last5 < last5_ma10).sum())
-        if days_below > params["MAX_DAYS_BELOW_MA10_IN_5"]:
-            return None
-
-    # 黑Ｋ限制：若收黑（close<open），則 close >= open * BLACK_CANDLE_MAX_DROP（預設 0.95）
-    if params["ENABLE_RULE_BLACK_CANDLE_LIMIT"] and (close_last < open_last):
-        if close_last < open_last * params["BLACK_CANDLE_MAX_DROP"]:
-            return None
-
-    # ---- 量能條件 ----
-    ok_vol, vol_ratio, v_today, v_avg = volume_today_over_prevN(
-        df["Volume"], params["VOLUME_LOOKBACK"], params["VOLUME_MULTIPLIER"]
-    )
-    if not ok_vol:
-        return None
-
-    # 近 10 日逐日量下限
-    if not last_n_all_volume_at_least(df["Volume"], 10, params["MIN_VOL_10D"]):
-        return None
-
-    # —— 排名需要的指標 ——
-    kd_spread = k_last - d_last
-    trend_strength = (close_last - ma20_last) / ma20_last if ma20_last > 0 else np.nan
-    if np.isnan(trend_strength):
-        return None
 
     res = {
-        "date": pd.to_datetime(df.index[-1]).date().isoformat(),
+        "date": pd.to_datetime(df.index[i_last]).date().isoformat(),
         "close": close_last,
         "open": open_last,
         "K": k_last,
@@ -285,8 +356,9 @@ def evaluate_signals_for_ticker(
         "v_today": float(v_today),
         "v_avg20": float(v_avg),
         "ma20": ma20_last,
-        "trend_strength": float(trend_strength),
-        "cross_day": pd.to_datetime(df.index[cross_idx]).date().isoformat(),
+        "trend_strength": float(trend_strength) if not np.isnan(trend_strength) else np.nan,
+        "cross_day": pd.to_datetime(df.index[cross_idx]).date().isoformat() if cross_idx is not None else None,
+        "streak_days": int(streak),   # ★ 新增：連續出現幾天（含今天）
     }
     return res
 
@@ -391,7 +463,7 @@ def run_once():
     df_out["n_k"] = df_out["kd_spread"].rank(method="first", ascending=False).astype(int)
     df_out["n_v"] = df_out["vol_ratio"].rank(method="first", ascending=False).astype(int)
 
-    # a, b, c 與 Score
+    # a, b, c 與 Score（你指定的新係數）
     df_out["a"] = 2.0 - 0.02 * df_out["n_k"]
     df_out["b"] = 2.0 - 0.02 * df_out["n_v"]
     df_out["c"] = df_out["trend_strength"]
@@ -405,7 +477,8 @@ def run_once():
     out_path = OUTPUT_DIR / f"picks_{today}.csv"
     keep_cols = [
         "date", "code", "name", "close", "K", "D", "vol_ratio",
-        "cross_day", "market_cap", "kd_spread", "n_k", "n_v", "a", "b", "c", "score"
+        "cross_day", "market_cap", "kd_spread", "n_k", "n_v", "a", "b", "c", "score",
+        "streak_days"  # ★ 新增輸出欄位
     ]
     for col in keep_cols:
         if col not in df_out.columns:
@@ -413,22 +486,23 @@ def run_once():
     df_out.to_csv(out_path, index=False, encoding="utf-8-sig")
     logger.info(f"Saved results to {out_path} (count={len(df_out)})")
 
-    # 7) 通知（Telegram：只顯示 收盤/KD/放量倍數；取前 TOP_N）
+    # 7) 通知（Telegram：只顯示 收盤/KD/放量倍數；取前 TOP_N；若 streak>=2 加註）
     top_n = int(params["TOP_N"])
     if params.get("TELEGRAM_BOT_TOKEN") and params.get("TELEGRAM_CHAT_ID"):
         head = df_out.head(top_n)
         lines = [f"[TWSE/TPEX KD Screener] {today} 前{min(top_n, len(head))}名"]
         for _, r in head.iterrows():
             try:
-                line = (
+                base = (
                     f"{str(r['code']).zfill(4)} {r['name']} | "
                     f"收盤 {float(r['close']):.2f} | "
                     f"KD {float(r['K']):.2f}/{float(r['D']):.2f} | "
                     f"量能倍數 {float(r['vol_ratio']):.2f}"
                 )
-                lines.append(line)
+                if pd.notna(r.get("streak_days")) and int(r.get("streak_days", 0)) >= 2:
+                    base += f" | 連續 {int(r['streak_days'])} 天"
+                lines.append(base)
             except Exception:
-                # 容錯避免因 NaN 導致整體失敗
                 lines.append(f"{str(r.get('code','')).zfill(4)} {r.get('name','')} | 資料格式異常")
         send_telegram_message(
             params["TELEGRAM_BOT_TOKEN"],
@@ -438,21 +512,23 @@ def run_once():
     else:
         logger.info("Telegram not configured; skip Telegram sending.")
 
-    # 8) Email（若已設定則帶附件寄出；否則略過）
+    # 8) Email（若已設定則帶附件寄出；否則略過）—— 內文同樣不特別展示 streak，以 CSV 為準
     try:
         if params.get("RECIPIENT_EMAIL") and params.get("SMTP_HOST") and params.get("SMTP_USER"):
             from notify.emailer import send_email_with_attachments
             subject = f"[TWSE/TPEX KD Screener] {today} 選股結果（共 {len(df_out)} 檔）"
-            # 只在信文中摘要前 10 檔，欄位同 Telegram
             body_lines = [f"前10名（依 score）："]
             for _, r in df_out.head(10).iterrows():
                 try:
-                    body_lines.append(
+                    line = (
                         f"{str(r['code']).zfill(4)} {r['name']} | "
                         f"收盤 {float(r['close']):.2f} | "
                         f"KD {float(r['K']):.2f}/{float(r['D']):.2f} | "
                         f"量能倍數 {float(r['vol_ratio']):.2f}"
                     )
+                    if pd.notna(r.get("streak_days")) and int(r.get("streak_days", 0)) >= 2:
+                        line += f" | 連續 {int(r['streak_days'])} 天"
+                    body_lines.append(line)
                 except Exception:
                     body_lines.append(f"{str(r.get('code','')).zfill(4)} {r.get('name','')} | 資料格式異常")
             body = "\n".join(body_lines)
