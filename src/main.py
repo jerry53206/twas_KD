@@ -1,349 +1,209 @@
-#!/usr/bin/env python3
-import os
-import sys
-import logging
-import traceback
-from pathlib import Path
-from datetime import datetime
-from typing import Dict, List, Tuple
-
-import numpy as np
-import pandas as pd
-from dotenv import load_dotenv
-
-from universe.twse_listed import fetch_twse_listed_equities  # TWSE+TPEX
-from data_sources.yahoo import download_ohlcv_batches
-from data_sources.yahoo_meta import get_market_caps
-from indicators.ta import stochastic_kd
-from filters.conditions import (
-    golden_cross_in_window,
-    volume_today_over_ma20,
-    volume_min_last_n,
-)
-
-# --------------------- 基礎設定 ---------------------
-ROOT = Path(__file__).resolve().parents[1]
-OUTPUT_DIR = ROOT / "output"
-LOG_DIR = ROOT / "logs"
-OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
-LOG_DIR.mkdir(exist_ok=True, parents=True)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_DIR / "app.log", encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
-)
-logger = logging.getLogger("twse_kd_screener")
-
-
-def _bool_env(v: str, default=False) -> bool:
-    if v is None:
-        return default
-    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-def get_env_params() -> Dict:
-    load_dotenv(ROOT / ".env", override=True)
-    return dict(
-        # KD 參數 & 條件
-        KD_N=int(os.getenv("KD_N", "9")),
-        KD_K_SMOOTH=int(os.getenv("KD_K_SMOOTH", "3")),
-        KD_D_PERIOD=int(os.getenv("KD_D_PERIOD", "3")),
-        KD_CROSS_WINDOW=int(os.getenv("KD_CROSS_WINDOW", "3")),
-        KD_REQUIRE_ZONE=_bool_env(os.getenv("KD_REQUIRE_ZONE", "false")),
-        KD_ZONE_LOW=float(os.getenv("KD_ZONE_LOW", "40")),
-        KD_ZONE_HIGH=float(os.getenv("KD_ZONE_HIGH", "80")),
-
-        # 量能規則（當日量 > 20MA × 倍數）
-        VOLUME_LOOKBACK=int(os.getenv("VOLUME_LOOKBACK", "20")),
-        VOLUME_MULTIPLIER=float(os.getenv("VOLUME_MULTIPLIER", "1.5")),
-
-        # 黑K 限制
-        ENABLE_RULE_BLACK_CANDLE_LIMIT=_bool_env(os.getenv("ENABLE_RULE_BLACK_CANDLE_LIMIT", "true")),
-        BLACK_CANDLE_MAX_DROP=float(os.getenv("BLACK_CANDLE_MAX_DROP", "0.95")),
-
-        # MA 結構
-        ENABLE_RULE_OC_ABOVE_MA20=_bool_env(os.getenv("ENABLE_RULE_OC_ABOVE_MA20", "true")),
-        ENABLE_RULE_LAST5_MA10_THRESHOLD=_bool_env(os.getenv("ENABLE_RULE_LAST5_MA10_THRESHOLD", "true")),
-        MAX_DAYS_BELOW_MA10_IN_5=int(os.getenv("MAX_DAYS_BELOW_MA10_IN_5", "3")),
-        ENABLE_RULE_MA5_GT_MA20=_bool_env(os.getenv("ENABLE_RULE_MA5_GT_MA20", "true")),
-
-        # 流動性門檻（新增）
-        MIN_LIQ_N=int(os.getenv("MIN_LIQ_N", "10")),
-        MIN_LIQ_SHARES=int(os.getenv("MIN_LIQ_SHARES", "1000000")),
-
-        # 市值門檻
-        MARKET_CAP_MIN=float(os.getenv("MARKET_CAP_MIN", "10000000000")),  # 100 億
-
-        # 報表與批次
-        TOP_N=int(os.getenv("TOP_N", "20")),     # 供摘要展示用
-        FINAL_TOP=int(os.getenv("FINAL_TOP", "5")),  # 最終操作標的數
-        BATCH_SIZE=int(os.getenv("BATCH_SIZE", "120")),
-
-        # Telegram（可留空）
-        TELEGRAM_BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN"),
-        TELEGRAM_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID"),
-    )
-
-
-def build_universe(params: Dict) -> pd.DataFrame:
-    """
-    回傳欄位：code, name, exchange, yahoo
-    上市(TWSE) 用 .TW，上櫃(TPEX) 用 .TWO
-    """
-    df = fetch_twse_listed_equities()  # 已含 TWSE+TPEX
-    suffix = df["exchange"].map({"TWSE": ".TW", "TPEX": ".TWO"}).fillna(".TW")
-    df["yahoo"] = df["code"].astype(str).str.zfill(4) + suffix
-    return df[["code", "name", "exchange", "yahoo"]]
-
-
-def _moving_averages(close: pd.Series) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    ma5 = close.rolling(5).mean()
-    ma10 = close.rolling(10).mean()
-    ma20 = close.rolling(20).mean()
-    return ma5, ma10, ma20
-
-
-def _send_telegram(bot_token: str, chat_id: str, text: str):
-    """
-    極簡 Telegram 發送（用 requests）。如果未設定，直接略過。
-    """
-    if not bot_token or not chat_id:
-        logger.info("Telegram not configured; skip Telegram sending.")
-        return
-    import requests
-    try:
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        resp = requests.post(url, data={"chat_id": chat_id, "text": text})
-        if resp.status_code != 200:
-            logger.warning(f"Telegram send failed: HTTP {resp.status_code} {resp.text}")
-        else:
-            logger.info("Telegram message sent.")
-    except Exception as e:
-        logger.warning(f"Telegram send exception: {e}")
-
-
+# ====================== 1) evaluate_signals_for_ticker（整段覆蓋） ======================
 def evaluate_signals_for_ticker(
-    df: pd.DataFrame, params: Dict, market_cap: float = None
-) -> Dict | None:
+    df: pd.DataFrame, params: dict, market_cap: float = None
+) -> Dict:
     """
-    給單一標的的 OHLCV（欄位：Open, High, Low, Close, Volume；日線），檢核是否通過『海選』。
-    若通過，回傳包含必要數值（供後續排序）之 dict；否則回傳 None。
+    給定單一標的的日線 OHLCV（含 Volume），檢查是否通過所有「海選」條件；
+    通過則回傳訊號資訊 dict，否則回傳 None。
+
+    依據條件：
+    A. 市值 >= MARK​ET_CAP_MIN（若有取到市值）
+    B. 結構/均線：
+       - MA5 > MA20
+       - 當日 Open 或 Close >= MA20
+       - 近 5 日中，收盤價 < MA10 的天數 <= 3
+       - 黑K 限制：若 Close < Open，則 Close >= Open * BLACK_CANDLE_MAX_DROP（預設 0.95）
+    C. 訊號：
+       - 最近 KD_CROSS_WINDOW 日內出現 K 向上穿越 D，且「當下（最後一日）K > D」
+       - （可選）若 KD_REQUIRE_ZONE=True，則交叉當日 K、D 都在 [KD_ZONE_LOW, KD_ZONE_HIGH]
+    D. 價量：
+       - 今日量 / 過去 20 日均量 >= VOLUME_MULTIPLIER（預設 1.5）
+    E. 流動性：
+       - 最近 10 個交易日，每一日成交量 >= 1,000,000
+
+    回傳欄位將包含：close, K, D, vol_ratio, cross_day, ma20, px_vs_ma20 等
     """
+
     if df is None or df.empty:
         return None
+
+    # 確保 Volume 有意義
     if df["Volume"].fillna(0).sum() == 0:
         return None
 
-    # 市值門檻
-    if market_cap is not None and market_cap < params["MARKET_CAP_MIN"]:
+    # ---- 市值門檻 ----
+    if market_cap is not None and market_cap < float(params.get("MARKET_CAP_MIN", 1e10)):
         return None
 
+    # ---- 基本資料與均線 ----
     close = df["Close"]
     open_ = df["Open"]
     high = df["High"]
     low = df["Low"]
-    volume = df["Volume"]
+    vol = df["Volume"]
 
-    # 需至少有足夠歷史長度
-    need_len = max(60, params["VOLUME_LOOKBACK"] + params["KD_N"] + params["KD_K_SMOOTH"] + params["KD_D_PERIOD"] + 5)
+    ma5 = close.rolling(5).mean()
+    ma10 = close.rolling(10).mean()
+    ma20 = close.rolling(20).mean()
+
+    # 歷史足夠性檢查
+    need_len = max(
+        int(params.get("VOLUME_LOOKBACK", 20)) + 1,
+        30,
+        int(params.get("KD_N", 9)) + int(params.get("KD_K_SMOOTH", 3)) + int(params.get("KD_D_PERIOD", 3)),
+    )
     if len(df) < need_len:
         return None
 
-    # 計算 KD
+    # ---- KD 計算 ----
     K, D = stochastic_kd(
         high, low, close,
-        n=params["KD_N"],
-        k_smooth=params["KD_K_SMOOTH"],
-        d_period=params["KD_D_PERIOD"]
+        n=int(params.get("KD_N", 9)),
+        k_smooth=int(params.get("KD_K_SMOOTH", 3)),
+        d_period=int(params.get("KD_D_PERIOD", 3))
     )
-    if K is None or D is None:
+    if K is None or D is None or np.isnan(K.iloc[-1]) or np.isnan(D.iloc[-1]):
         return None
 
-    # C1: 最近 3 日曾黃金交叉；且「當下」K > D；（可選）交叉當日要在區間
-    cross_idx = golden_cross_in_window(
-        K, D,
-        window=params["KD_CROSS_WINDOW"],
-        zone_low=params["KD_ZONE_LOW"],
-        zone_high=params["KD_ZONE_HIGH"],
-        require_both_in_zone=params["KD_REQUIRE_ZONE"]
-    )
+    # ---- KD 黃金交叉 within window + 當下 K > D +（可選）區間限制 ----
+    window = int(params.get("KD_CROSS_WINDOW", 3))
+    require_zone = bool(str(params.get("KD_REQUIRE_ZONE", "false")).lower() == "true")
+    zone_low = float(params.get("KD_ZONE_LOW", 40.0))
+    zone_high = float(params.get("KD_ZONE_HIGH", 80.0))
+
+    def _find_cross_idx_in_last_n(Ks: pd.Series, Ds: pd.Series, n: int) -> int | None:
+        start = max(1, len(Ks) - n)
+        for i in range(start, len(Ks)):
+            k_prev, d_prev = Ks.iloc[i - 1], Ds.iloc[i - 1]
+            k_curr, d_curr = Ks.iloc[i], Ds.iloc[i]
+            if np.isnan([k_prev, d_prev, k_curr, d_curr]).any():
+                continue
+            crossed = (k_prev <= d_prev) and (k_curr > d_curr)
+            if not crossed:
+                continue
+            if require_zone:
+                in_zone = (zone_low <= k_curr <= zone_high) and (zone_low <= d_curr <= zone_high)
+                if not in_zone:
+                    continue
+            return i
+        return None
+
+    cross_idx = _find_cross_idx_in_last_n(K, D, window)
     if cross_idx is None:
         return None
+
+    # 「當下」K > D（最後一根）
     if not (K.iloc[-1] > D.iloc[-1]):
         return None
 
-    # D1: 當日放量 ≥ 20MA × 倍數
-    vol_ok, vol_ratio, v_today, v20avg = volume_today_over_ma20(
-        volume, lookback=params["VOLUME_LOOKBACK"], multiplier=params["VOLUME_MULTIPLIER"]
-    )
-    if not vol_ok:
+    # ---- 放量規則：今日量 / 過去 20 日均量 >= multiplier（母體為前 20 日，不含今日） ----
+    lookback = int(params.get("VOLUME_LOOKBACK", 20))
+    multiplier = float(params.get("VOLUME_MULTIPLIER", 1.5))
+    if len(vol) < lookback + 1:
+        return None
+    v_today = float(vol.iloc[-1])
+    v20 = float(vol.iloc[-(lookback + 1):-1].mean())  # 不含今日
+    if v20 <= 0:
+        return None
+    vol_ratio = v_today / v20
+    if vol_ratio < multiplier:
         return None
 
-    # E1: 近 10 日，每一日成交量皆 ≥ 100萬股
-    if not volume_min_last_n(volume, n=params["MIN_LIQ_N"], min_shares=params["MIN_LIQ_SHARES"]):
+    # ---- 流動性門檻：最近 10 日，每一日成交量 >= 1,000,000 ----
+    liq_n = int(params.get("LIQ_MIN_VOLUME_N", 10))
+    liq_min = int(params.get("LIQ_MIN_SHARES", 1_000_000))
+    if len(vol) < liq_n:
+        return None
+    if not (vol.iloc[-liq_n:] >= liq_min).all():
         return None
 
-    # B: 結構與保護
-    ma5, ma10, ma20 = _moving_averages(close)
-    if params["ENABLE_RULE_MA5_GT_MA20"]:
-        if not (ma5.iloc[-1] > ma20.iloc[-1]):
+    # ---- 均線/結構規則 ----
+    ma5_gt_ma20_en = bool(str(params.get("ENABLE_RULE_MA5_GT_MA20", "true")).lower() == "true")
+    if ma5_gt_ma20_en and not (ma5.iloc[-1] > ma20.iloc[-1]):
+        return None
+
+    oc_above_ma20_en = bool(str(params.get("ENABLE_RULE_OC_ABOVE_MA20", "true")).lower() == "true")
+    if oc_above_ma20_en and not ((open_.iloc[-1] >= ma20.iloc[-1]) or (close.iloc[-1] >= ma20.iloc[-1])):
+        return None
+
+    last5_ma10_en = bool(str(params.get("ENABLE_RULE_LAST5_MA10_THRESHOLD", "true")).lower() == "true")
+    max_below_days = int(params.get("MAX_DAYS_BELOW_MA10_IN_5", 3))
+    if last5_ma10_en:
+        recent5 = close.iloc[-5:]
+        ma10_5 = ma10.iloc[-5:]
+        below_days = int((recent5 < ma10_5).sum())
+        if below_days > max_below_days:
             return None
 
-    if params["ENABLE_RULE_OC_ABOVE_MA20"]:
-        if not ((open_.iloc[-1] >= ma20.iloc[-1]) or (close.iloc[-1] >= ma20.iloc[-1])):
+    # ---- 黑K 限制 ----
+    black_en = bool(str(params.get("ENABLE_RULE_BLACK_CANDLE_LIMIT", "true")).lower() == "true")
+    black_drop = float(params.get("BLACK_CANDLE_MAX_DROP", 0.95))
+    if black_en and (close.iloc[-1] < open_.iloc[-1]):
+        if not (close.iloc[-1] >= open_.iloc[-1] * black_drop):
             return None
 
-    if params["ENABLE_RULE_LAST5_MA10_THRESHOLD"]:
-        last5_close = close.iloc[-5:]
-        last5_ma10 = ma10.iloc[-5:]
-        days_below = int((last5_close < last5_ma10).sum())
-        if days_below > params["MAX_DAYS_BELOW_MA10_IN_5"]:
-            return None
+    # ---- 回傳訊息（供排序與輸出）----
+    last_idx = df.index[-1]
+    ma20_today = float(ma20.iloc[-1]) if not np.isnan(ma20.iloc[-1]) else None
+    px_vs_ma20 = (float(close.iloc[-1]) - ma20_today) / ma20_today if (ma20_today and ma20_today != 0) else None
 
-    # D2: 黑K 限制
-    if params["ENABLE_RULE_BLACK_CANDLE_LIMIT"]:
-        if close.iloc[-1] < open_.iloc[-1]:
-            if not (close.iloc[-1] >= open_.iloc[-1] * params["BLACK_CANDLE_MAX_DROP"]):
-                return None
-
-    # 供排序用的指標
-    kd_spread = float(K.iloc[-1] - D.iloc[-1])
-    c_trend = float((close.iloc[-1] - ma20.iloc[-1]) / ma20.iloc[-1]) if ma20.iloc[-1] > 0 else np.nan
-
-    return {
-        "date": pd.to_datetime(df.index[-1]).date().isoformat(),
+    res = {
+        "date": pd.to_datetime(last_idx).date().isoformat(),
         "close": float(close.iloc[-1]),
-        "open": float(open_.iloc[-1]),
         "K": float(K.iloc[-1]) if not np.isnan(K.iloc[-1]) else None,
         "D": float(D.iloc[-1]) if not np.isnan(D.iloc[-1]) else None,
-        "kd_spread": kd_spread,          # 因子 a 的排序依據
-        "vol_ratio": float(vol_ratio),   # 因子 b 的排序依據
-        "ma20": float(ma20.iloc[-1]),
-        "trend_c": c_trend,              # 因子 c 直接取值
+        "vol_ratio": float(vol_ratio),
         "cross_day": pd.to_datetime(df.index[cross_idx]).date().isoformat(),
-        "v_today": float(v_today) if not np.isnan(v_today) else None,
-        "v20avg": float(v20avg) if not np.isnan(v20avg) else None,
+        "ma20": ma20_today,
+        "px_vs_ma20": px_vs_ma20,  # 排序因子 c 會用到
     }
+    return res
 
 
-def run_once():
-    params = get_env_params()
-    logger.info(
-        "Params loaded: KD=(%d,%d,%d), window=%d, zone=%s[%g~%g], "
-        "VOL: N=%d x%.2f, MIN_LIQ=%dd≥%d, TOP_N=%d, FINAL_TOP=%d, MCAP_MIN=%d",
-        params["KD_N"], params["KD_K_SMOOTH"], params["KD_D_PERIOD"],
-        params["KD_CROSS_WINDOW"],
-        "ON" if params["KD_REQUIRE_ZONE"] else "OFF",
-        params["KD_ZONE_LOW"], params["KD_ZONE_HIGH"],
-        params["VOLUME_LOOKBACK"], params["VOLUME_MULTIPLIER"],
-        params["MIN_LIQ_N"], params["MIN_LIQ_SHARES"],
-        params["TOP_N"], params["FINAL_TOP"], int(params["MARKET_CAP_MIN"])
-    )
-
-    logger.info("Building universe from TWSE/TPEX ISIN page...")
-    uni = build_universe(params)
-    logger.info(f"Universe size: {len(uni)}")
-
-    tickers = uni["yahoo"].tolist()
-    code_map = dict(zip(uni["yahoo"], uni["code"]))
-    name_map = dict(zip(uni["yahoo"], uni["name"]))
-
-    logger.info("Downloading OHLCV from Yahoo in batches...")
-    data_map = download_ohlcv_batches(
-        tickers, period="6mo", interval="1d",
-        batch_size=params["BATCH_SIZE"], retries=2, sleep_sec=1.0
-    )
-
-    # 先做「放量 & 基本結構」的初篩，再查市值（減少 meta 呼叫量）
-    prelim = {}
-    for ysym, df in data_map.items():
-        try:
-            # 先不帶市值，僅做基本檢核：量能/MA/KD；通過者再補市值檢核
-            sig = evaluate_signals_for_ticker(df, {**params, "MARKET_CAP_MIN": -1})
-            if sig:
-                prelim[ysym] = sig
-        except Exception as e:
-            logger.warning(f"Preliminary evaluation failed for {ysym}: {e}")
-
-    # 取得市值，僅限 prelim 候選名單
-    logger.info(f"Fetching market caps from Yahoo for {len(prelim)} candidates...")
-    mc_map = get_market_caps(list(prelim.keys()), retries=1, sleep=0.05)
-
-    # 補上市值門檻，再形成 rows
-    rows: List[Dict] = []
-    for ysym, sig in prelim.items():
-        mcap = mc_map.get(ysym)
-        if mcap is None or mcap < params["MARKET_CAP_MIN"]:
-            continue
-        rows.append({
-            "date": sig["date"],
-            "code": code_map.get(ysym, ""),
-            "name": name_map.get(ysym, ""),
-            "close": sig["close"],
-            "K": sig["K"],
-            "D": sig["D"],
-            "kd_spread": sig["kd_spread"],     # a 的排序依據
-            "vol_ratio": sig["vol_ratio"],     # b 的排序依據
-            "ma20": sig["ma20"],
-            "trend_c": sig["trend_c"],         # c 的原始值
-            "cross_day": sig["cross_day"],
-            "market_cap": float(mcap),
-        })
-
+# ====================== 2) 排序/權重區塊（放在 run_once() 末端，覆蓋原排序） ======================
+    # ---- Ranking system (updated factors a, b, c) ----
     if rows:
         df_out = pd.DataFrame(rows)
-        # ------- 排序因子 -------
-        # a: 依 kd_spread 由高到低排名 -> a = 1.1 - 0.02 * n
-        df_out["rank_a"] = df_out["kd_spread"].rank(method="min", ascending=False).astype(int)
-        df_out["a"] = 1.1 - 0.02 * df_out["rank_a"]
+        # 動能擴散（K-D）、量比名次
+        df_out["k_d_spread"] = df_out["K"] - df_out["D"]
+        # 名次從 1 起算（由高到低）
+        df_out["n_k"] = df_out["k_d_spread"].rank(ascending=False, method="min").astype(int)
+        df_out["n_v"] = df_out["vol_ratio"].rank(ascending=False, method="min").astype(int)
 
-        # b: 依 vol_ratio 由高到低排名 -> b = 1.1 - 0.02 * n
-        df_out["rank_b"] = df_out["vol_ratio"].rank(method="min", ascending=False).astype(int)
-        df_out["b"] = 1.1 - 0.02 * df_out["rank_b"]
+        # 因子 a、b
+        df_out["a"] = 2.0 - 0.02 * df_out["n_k"]
+        df_out["b"] = 2.0 - 0.02 * df_out["n_v"]
+        # 若你擔心樣本數很大導致 a/b 變負，可解開下面兩行做裁切：
+        # df_out["a"] = df_out["a"].clip(lower=0)
+        # df_out["b"] = df_out["b"].clip(lower=0)
 
-        # c: 直接取 trend_c = (Close - MA20)/MA20
-        df_out["c"] = df_out["trend_c"]
+        # 因子 c = (Close - MA20) / MA20
+        if "px_vs_ma20" in df_out.columns and df_out["px_vs_ma20"].notna().any():
+            df_out["c"] = df_out["px_vs_ma20"]
+        elif {"close", "ma20"}.issubset(df_out.columns):
+            df_out["c"] = (df_out["close"] - df_out["ma20"]) / df_out["ma20"]
+        else:
+            df_out["c"] = np.nan
+            logger.warning("px_vs_ma20 / ma20 欄位缺少，c 因子無法完整計算。")
 
         # 最終分數
-        df_out["score"] = df_out["a"] * df_out["b"] * df_out["c"]
+        df_out["final_score"] = df_out["a"] * df_out["b"] * df_out["c"]
 
-        # 依 score 由高到低
-        df_out = df_out.sort_values(["score"], ascending=False, kind="mergesort")
+        # 依 final_score（高→低）排序；同分再看 vol_ratio
+        df_out = df_out.sort_values(["final_score", "vol_ratio"], ascending=[False, False])
+
+        # 只保留你需要輸出的欄位
+        cols = [
+            "date","code","name","close","K","D","vol_ratio","cross_day",
+            "ma20","px_vs_ma20","a","b","c","final_score","market_cap"
+        ]
+        df_out = df_out[[c for c in cols if c in df_out.columns]]
+
+        # 取 Top N
+        top_n = int(params.get("TOP_N", 20))
+        df_out = df_out.head(top_n)
     else:
-        df_out = pd.DataFrame(
-            columns=["date","code","name","close","K","D","kd_spread","vol_ratio","ma20","trend_c","cross_day","market_cap","a","b","c","score"]
-        )
-
-    today = datetime.now().strftime("%Y%m%d")
-    out_path = OUTPUT_DIR / f"picks_{today}.csv"
-    df_out.to_csv(out_path, index=False, encoding="utf-8-sig")
-    logger.info(f"Saved results to {out_path} (count={len(df_out)})")
-
-    # -------- Telegram 摘要（僅顯示：今日收盤、KD、放量倍數） --------
-    try:
-        if len(df_out) == 0:
-            msg = f"【TWSE/TPEX KD Screener】{today}\n今日無符合條件之個股。"
-        else:
-            top_n = min(params["TOP_N"], len(df_out))
-            head = df_out.head(top_n)
-            lines = [f"【TWSE/TPEX KD Screener】{today} 前{top_n}（依 score）"]
-            for _, r in head.iterrows():
-                k = r['K'] if pd.notna(r['K']) else np.nan
-                d = r['D'] if pd.notna(r['D']) else np.nan
-                lines.append(
-                    f"{r['code']} {r['name']} | 收盤 {r['close']:.2f} | KD {k:.2f}/{d:.2f} | 量能倍數 {r['vol_ratio']:.2f}"
-                )
-            msg = "\n".join(lines)
-
-        _send_telegram(params.get("TELEGRAM_BOT_TOKEN"), params.get("TELEGRAM_CHAT_ID"), msg)
-
-    except Exception as e:
-        logger.error(f"Telegram sending failed: {e}\n{traceback.format_exc()}")
-
-
-if __name__ == "__main__":
-    run_once()
+        df_out = pd.DataFrame(columns=[
+            "date","code","name","close","K","D","vol_ratio","cross_day",
+            "ma20","px_vs_ma20","a","b","c","final_score","market_cap"
+        ])
