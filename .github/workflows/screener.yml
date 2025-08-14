@@ -1,18 +1,19 @@
-name: TWSE/TPEX KD Screener (Daily 15:00 TPE)
+# TWSE+TPEX KD Screener — 每天台北時間 15:00 執行
+# 備註：
+# 1) 會在 output/ 產生 picks_YYYYMMDD.csv
+# 2) CSV 欄位包含「streak_days」（連續出現天數；若今日無標的則可能為空表）
+# 3) 若設定了 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID，會推送摘要
+
+name: TWSE KD Screener (Daily 15:00 TPE)
 
 on:
   schedule:
-    - cron: "0 7 * * *"     # 每日 07:00 UTC = 台北 15:00
+    - cron: "0 7 * * *"   # 07:00 UTC = 15:00 TPE
   workflow_dispatch:
 
 jobs:
   run-screener:
     runs-on: ubuntu-latest
-
-    # 把 secrets 映射成環境變數，方便 step 之間使用
-    env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
       - name: Checkout
@@ -27,12 +28,13 @@ jobs:
       - name: Create .env for this run
         run: |
           cat > .env << 'EOF'
-          # —— 通知設定（用於主程式）——
-          TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
-          TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+          # —— 通知（請到 GitHub Repo > Settings > Secrets 新增）——
+          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
 
           # —— 參數（可依需求調整）——
           TOP_N=20
+
           KD_N=9
           KD_K_SMOOTH=3
           KD_D_PERIOD=3
@@ -43,6 +45,7 @@ jobs:
 
           VOLUME_LOOKBACK=20
           VOLUME_MULTIPLIER=1.5
+          MIN_VOL_10D=1000000
 
           ENABLE_RULE_BLACK_CANDLE_LIMIT=true
           BLACK_CANDLE_MAX_DROP=0.95
@@ -57,37 +60,39 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -U pip
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            # 你程式用到的最低組合（如需 yfinance/bs4 請加上）
-            pip install pandas numpy requests python-dotenv lxml yfinance beautifulsoup4
+            pip install pandas numpy requests python-dotenv lxml yfinance
           fi
 
       - name: Run screener
+        env:
+          TZ: Asia/Taipei
         run: python src/main.py
 
-      - name: Show outputs & logs (for debugging)
-        if: always()
+      - name: Show CSV headers (streak_days should be present when there are results)
         run: |
-          echo "== repo tree =="
-          ls -R
-          echo "== output =="
-          ls -al output || true
-          echo "== logs =="
-          ls -al logs || true
-          echo "== tail app.log =="
-          tail -n 200 logs/app.log || true
-
-      - name: Ensure at least one CSV exists (create empty if none)
-        if: always()
-        run: |
-          mkdir -p output
-          if ! ls output/*.csv >/dev/null 2>&1; then
-            echo "No CSV found; creating an empty CSV placeholder."
-            # 欄位請依你的 main.py 寫出來的欄位名稱為準（這份是常見欄位）
-            echo "date,code,name,close,K,D,vol_ratio,cross_day,market_cap,k_minus_d,rank_k,rank_v,trend_c,score" > "output/empty_$(date -u +%Y%m%d).csv"
+          ls -l output || true
+          if compgen -G "output/*.csv" > /dev/null; then
+            echo "---- CSV first lines ----"
+            head -n 2 output/*.csv || true
+            echo "-------------------------"
+            python - << 'PY'
+import glob, pandas as pd, os
+files = glob.glob("output/*.csv")
+if not files:
+    print("No CSV generated.")
+else:
+    for f in files:
+        try:
+            df = pd.read_csv(f)
+            print(f"Columns in {os.path.basename(f)}:", ", ".join(df.columns))
+        except Exception as e:
+            print(f"Read failed for {f}: {e}")
+PY
+          else
+            echo "No CSV files found in output/ (可能今日完全無標的，或程式提前返回)。"
           fi
 
       - name: Upload CSV artifact
@@ -95,14 +100,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: picks-${{ github.run_id }}
-          path: output/
+          path: output/*.csv
           retention-days: 14
 
-      # 可選：測試 Telegram 是否可用（用 env 判斷是否有設）
-      - name: (Test) send a Telegram ping
-        if: ${{ env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
+      - name: (Optional) Telegram ping to verify secrets
+        if: ${{ secrets.TELEGRAM_BOT_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != '' }}
         run: |
-          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TELEGRAM_CHAT_ID}" \
-            -d text="✅ GitHub Actions: Telegram 測試成功（twas_KD）" \
+          curl -sS -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d text="✅ GitHub Actions: 已完成執行，CSV 含 streak_days 欄位（若有標的）。" \
             -o /dev/null -w "HTTP %{http_code}\n"
