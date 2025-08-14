@@ -1,4 +1,13 @@
-# ====================== 1) evaluate_signals_for_ticker（整段覆蓋） ======================
+#!/usr/bin/env python3
+import os, sys, math, time, smtplib, logging, traceback
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import List, Dict
+
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+
 def evaluate_signals_for_ticker(
     df: pd.DataFrame, params: dict, market_cap: float = None
 ) -> Dict:
