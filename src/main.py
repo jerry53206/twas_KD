@@ -39,6 +39,7 @@ except Exception:
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = ROOT / "output"
 LOG_DIR = ROOT / "logs"
+HISTORY_DIR = ROOT / "history"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -112,20 +113,20 @@ def today_str_tpe() -> str:
 
 def is_non_trading_today() -> bool:
     """
-    用 2330.TW 判斷是否有今日日K。收盤前執行通常無今日K，會判非交易日。
+    用 0050.TW 判斷是否有今日日K。收盤前執行通常無今日K，會判非交易日。
     """
     try:
         tz = pytz.timezone("Asia/Taipei")
         today_tpe = datetime.now(tz).date()
         m = download_ohlcv_batches(
-            tickers=["2330.TW"],
+            tickers=["0050.TW"],
             period="1mo",
             interval="1d",
             batch_size=1,
             retries=1,
             sleep_sec=0.5
         )
-        df = m.get("2330.TW")
+        df = m.get("0050.TW")
         if df is None or df.empty:
             return True
         last_date = pd.to_datetime(df.index[-1]).date()
@@ -213,14 +214,26 @@ def compute_streak_days(code: str, today: datetime.date, lookback_days: int = 14
     計算「連續出現天數」：含今天。
     逐日回看 picks_YYYYMMDD.csv，直到缺檔或未出現即中斷。
     """
+from datetime import datetime, timedelta
+
+def _find_pick_file_by_date(dte: datetime.date) -> Optional[Path]:
+    fname = f"picks_{dte.strftime('%Y%m%d')}.csv"
+    # 先找 output，再找 history
+    for base in (OUTPUT_DIR, HISTORY_DIR):
+        p = base / fname
+        if p.exists():
+            return p
+    return None
+
+def compute_streak_days(code: str, today: datetime.date, lookback_days: int = 14) -> int:
     streak = 1
     for d in range(1, lookback_days + 1):
         dte = (datetime.combine(today, datetime.min.time()) - timedelta(days=d)).date()
-        fname = OUTPUT_DIR / f"picks_{dte.strftime('%Y%m%d')}.csv"
-        if not fname.exists():
+        p = _find_pick_file_by_date(dte)
+        if p is None:
             break
         try:
-            df_prev = pd.read_csv(fname, dtype={"code": str})
+            df_prev = pd.read_csv(p, dtype={"code": str})
             if not (df_prev["code"].astype(str) == str(code)).any():
                 break
             streak += 1
