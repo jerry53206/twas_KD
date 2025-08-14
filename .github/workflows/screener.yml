@@ -1,13 +1,18 @@
-name: TWSE KD Screener (Daily 15:00 TPE)
+name: TWSE/TPEX KD Screener (13:40 TPE)
 
 on:
   schedule:
-    - cron: "40 5 * * 1-5"  # 每個交易日(周一~周五) 台北 13:40
+    - cron: "40 5 * * 1-5"   # 台北 13:40（UTC+8）
   workflow_dispatch:
 
 jobs:
   run-screener:
     runs-on: ubuntu-latest
+
+    # 將 secrets 映射成環境變數，步驟裡只用 env.*
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
       - name: Checkout
@@ -22,12 +27,12 @@ jobs:
       - name: Create .env for this run
         run: |
           cat > .env << 'EOF'
-          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+          # ===== 通知 =====
+          TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+          TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 
-          # ---- Params ----
+          # ===== 參數（可依需求調整）=====
           TOP_N=20
-
           KD_N=9
           KD_K_SMOOTH=3
           KD_D_PERIOD=3
@@ -38,7 +43,6 @@ jobs:
 
           VOLUME_LOOKBACK=20
           VOLUME_MULTIPLIER=1.5
-          MIN_VOL_10D=1000000
 
           ENABLE_RULE_BLACK_CANDLE_LIMIT=true
           BLACK_CANDLE_MAX_DROP=0.95
@@ -56,24 +60,11 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install pandas numpy requests python-dotenv lxml yfinance
+            pip install pandas numpy requests python-dotenv lxml yfinance pytz
           fi
 
       - name: Run screener
-        env:
-          TZ: Asia/Taipei
         run: python src/main.py
-
-      - name: List outputs (if any)
-        run: |
-          mkdir -p output
-          ls -lh output || true
-          if compgen -G "output/*.csv" > /dev/null; then
-            echo "Preview first CSV:"
-            head -n 5 $(ls -1 output/*.csv | head -n1) || true
-          else
-            echo "No CSV generated (可能是今日無標的或篩選過嚴)。"
-          fi
 
       - name: Upload CSV artifact
         if: always()
@@ -83,10 +74,12 @@ jobs:
           path: output/*.csv
           retention-days: 14
 
-      - name: Telegram ping (optional)
-        if: ${{ (secrets.TELEGRAM_BOT_TOKEN != '') && (secrets.TELEGRAM_CHAT_ID != '') }}
+      - name: (Optional) Telegram ping (no secrets in if)
         run: |
-          curl -sS -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
-            -d text="✅ GitHub Actions: Screener 已完成（若有標的已輸出 CSV 並含 streak_days 欄位）" \
-            -o /dev/null -w "HTTP %{http_code}\n"
+          if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ]; then
+            curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_CHAT_ID}" \
+              -d text="✅ Workflow 執行完畢（twas_KD）" >/dev/null || true
+          else
+            echo "Telegram secrets not set; skip ping."
+          fi
