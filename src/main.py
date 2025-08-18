@@ -13,7 +13,7 @@ twas_KD 主程式（無需 TA-Lib 版本）
 - TELEGRAM_CHAT_ID
 
 檔案
-- universe.csv：可選。一行一個代碼（不含 .TW/.TWO；若要上櫃，建議直接寫完整如 6488.TWO）
+- universe.csv：可選。一行一個代碼（不含 .TW/.TWO；若要上櫃，建議直接寫 6488.TWO）
 - state/streaks.json：每檔最後入選日與連續天數
 - state/last_run.json：上一輪成功執行的交易日
 - output/*.csv：輸出結果
@@ -26,7 +26,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, date, timedelta
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
 
 import requests
 import numpy as np
@@ -55,6 +55,14 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 logger = logging.getLogger(APP_NAME)
+
+# ---------- 共用小工具 ----------
+def _ensure_series(x: Union[pd.Series, pd.DataFrame], index=None) -> pd.Series:
+    """把單欄 DataFrame/Series 都轉成 1D Series（float），保持索引對齊。"""
+    if isinstance(x, pd.DataFrame):
+        x = x.iloc[:, 0]
+    s = pd.to_numeric(pd.Series(x, index=index if index is not None else getattr(x, "index", None)), errors="coerce")
+    return s
 
 # ---------- 工具函式 ----------
 def today_taipei() -> date:
@@ -99,7 +107,6 @@ def fetch_last_trade_date_of(symbol: str, period_days: int = 7) -> Optional[date
         if df is None or df.empty:
             return None
         last_ts = df.index[-1]
-        # 視為 UTC，再 +8h 取日期（對判斷是否為今日足夠）
         last_dt = pd.to_datetime(last_ts).to_pydatetime()
         last_dt_tpe = last_dt + timedelta(hours=TZ_OFFSET_HOURS)
         return last_dt_tpe.date()
@@ -136,20 +143,20 @@ def fetch_history(symbols: List[str], lookback_days: int = 180) -> Dict[str, pd.
 def calc_kd(df: pd.DataFrame, n: int = 14, k_smooth: int = 3, d_smooth: int = 3) -> pd.DataFrame:
     """
     計算 Stochastic KD (n, k_smooth, d_smooth)。
-    內建處理盤整區間（最高=最低）之分母為 0：令 RSV=0.5，避免 NaN/Inf。
+    全 Pandas 寫法避免 ndarray 形狀 (N,1) 問題；盤整時（最高=最低）令 RSV=0.5。
     """
-    high = df["high"].astype(float)
-    low = df["low"].astype(float)
-    close = df["close"].astype(float)
+    high = _ensure_series(df["high"], index=df.index)
+    low = _ensure_series(df["low"], index=df.index)
+    close = _ensure_series(df["close"], index=df.index)
 
     lowest_low = low.rolling(window=n, min_periods=n).min()
     highest_high = high.rolling(window=n, min_periods=n).max()
-    denom = (highest_high - lowest_low)
+    denom = highest_high - lowest_low
 
-    rsv = np.where(denom == 0, 0.5, (close - lowest_low) / denom)
-    rsv = np.clip(rsv, 0.0, 1.0)
+    rsv = (close - lowest_low) / denom
+    rsv = rsv.where(denom != 0, 0.5)  # 分母為 0 => 0.5
+    rsv = rsv.clip(lower=0.0, upper=1.0)
 
-    rsv = pd.Series(rsv, index=close.index)
     K = rsv.ewm(alpha=1.0 / k_smooth, adjust=False, min_periods=k_smooth).mean() * 100.0
     D = K.ewm(alpha=1.0 / d_smooth, adjust=False, min_periods=d_smooth).mean()
 
@@ -158,8 +165,9 @@ def calc_kd(df: pd.DataFrame, n: int = 14, k_smooth: int = 3, d_smooth: int = 3)
     out["D"] = D
     return out
 
-def moving_avg(series: pd.Series, n: int = 20) -> pd.Series:
-    return series.rolling(n, min_periods=n).mean()
+def moving_avg(x: Union[pd.Series, pd.DataFrame], n: int = 20) -> pd.Series:
+    s = _ensure_series(x)
+    return s.rolling(n, min_periods=n).mean()
 
 # ---------- 連續出現狀態 ----------
 STREAKS_PATH = STATE_DIR / "streaks.json"
@@ -240,7 +248,7 @@ class RuleParams:
 
 def select_candidates(hist: Dict[str, pd.DataFrame], params: RuleParams) -> pd.DataFrame:
     """
-    依規則選股；修正布林歧義：一律取純量 float 再比較。
+    依規則選股；強制轉純量避免布林歧義。
     """
     rows = []
     for code, df in hist.items():
