@@ -186,4 +186,203 @@ def save_streaks(streaks: Dict[str, Dict]) -> None:
     save_json(STREAKS_PATH, streaks)
 
 def load_last_run_date() -> Optional[str]:
-    obj = load_j_
+    obj = load_json(LAST_RUN_PATH)
+    return obj.get("last_trade_date")
+
+def save_last_run_date(trade_date: date) -> None:
+    save_json(LAST_RUN_PATH, {"last_trade_date": trade_date.isoformat()})
+
+# ---------- 通知 ----------
+def tg_send_message(text: str, parse_mode: Optional[str] = "Markdown") -> None:
+    if not TG_TOKEN or not TG_CHAT_ID:
+        logger.info("未設定 Telegram 環境變數，略過傳訊息。")
+        return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TG_CHAT_ID,
+        "text": text,
+    }
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+        payload["disable_web_page_preview"] = True
+    try:
+        r = requests.post(url, data=payload, timeout=20)
+        if r.status_code != 200:
+            logger.warning("Telegram sendMessage 失敗：%s %s", r.status_code, r.text)
+    except Exception as e:
+        logger.warning("Telegram 傳訊息錯誤：%s", e)
+
+def tg_send_document(file_path: Path, caption: Optional[str] = None) -> None:
+    if not TG_TOKEN or not TG_CHAT_ID:
+        logger.info("未設定 Telegram 環境變數，略過傳檔。")
+        return
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendDocument"
+    files = {"document": (file_path.name, open(file_path, "rb"))}
+    data = {"chat_id": TG_CHAT_ID}
+    if caption:
+        data["caption"] = caption
+    try:
+        r = requests.post(url, data=data, files=files, timeout=60)
+        if r.status_code != 200:
+            logger.warning("Telegram sendDocument 失敗：%s %s", r.status_code, r.text)
+    except Exception as e:
+        logger.warning("Telegram 傳檔錯誤：%s", e)
+
+# ---------- 規則（可依需求調整） ----------
+@dataclass
+class RuleParams:
+    kd_n: int = 14
+    kd_k: int = 3
+    kd_d: int = 3
+    ma_n: int = 20
+    # 入選條件：KD 黃金交叉且 K、D < 50，並且收盤 > MA20
+    max_kd_level: float = 50.0
+
+def select_candidates(hist: Dict[str, pd.DataFrame], params: RuleParams) -> pd.DataFrame:
+    """
+    依規則選股；修正布林歧義：一律取純量 float 再比較。
+    """
+    rows = []
+    for code, df in hist.items():
+        if df.shape[0] < max(params.kd_n, params.ma_n) + 5:
+            continue
+        df2 = calc_kd(df, n=params.kd_n, k_smooth=params.kd_k, d_smooth=params.kd_d)
+        df2["ma"] = moving_avg(df2["close"], params.ma_n)
+        if df2["ma"].isna().all():
+            continue
+
+        tail = df2.dropna().iloc[-2:]
+        if tail.shape[0] < 2:
+            continue
+        prev_row = tail.iloc[0]
+        last_row = tail.iloc[1]
+
+        # 強制轉純量
+        k_prev = float(prev_row["K"])
+        d_prev = float(prev_row["D"])
+        k_last = float(last_row["K"])
+        d_last = float(last_row["D"])
+        close_last = float(last_row["close"])
+        ma_last = float(last_row["ma"])
+
+        # 入選條件
+        golden_cross = (k_prev <= d_prev) and (k_last > d_last)
+        kd_ok = (k_last < params.max_kd_level) and (d_last < params.max_kd_level)
+        ma_ok = close_last > ma_last
+
+        if golden_cross and kd_ok and ma_ok:
+            rows.append({
+                "code": code,
+                "date": last_row.name.date().isoformat(),
+                "close": round(close_last, 2),
+                "K": round(k_last, 2),
+                "D": round(d_last, 2),
+                "MA20": round(ma_last, 2),
+            })
+
+    df_out = pd.DataFrame(rows)
+    if not df_out.empty:
+        df_out = df_out.sort_values(by=["code"]).reset_index(drop=True)
+    return df_out
+
+# ---------- 主流程 ----------
+def main():
+    tpe_today = today_taipei()
+    logger.info("台北日期：%s", tpe_today.isoformat())
+
+    # 1) 判斷是否為交易日（以 2330.TW 最新收盤日期是否等於今日）
+    last_tsmc_date = fetch_last_trade_date_of("2330.TW", period_days=10)
+    if last_tsmc_date != tpe_today:
+        msg = f"【{APP_NAME}】{tpe_today.isoformat()} 今日為非交易日，請開心過好每一天。"
+        logger.info(msg)
+        tg_send_message(msg)
+        return
+
+    # 2) 下載股池歷史資料
+    universe = safe_read_universe()
+    hist = fetch_history(universe, lookback_days=220)
+
+    if not hist:
+        warn = f"【{APP_NAME}】{tpe_today.isoformat()} 今日資料抓取失敗（股池無資料）。"
+        logger.warning(warn)
+        tg_send_message(warn)
+        return
+
+    # 3) 規則選股
+    params = RuleParams()
+    df_top = select_candidates(hist, params)
+
+    if df_top.empty:
+        note = f"【{APP_NAME}】{tpe_today.isoformat()} 今日無入選標的。"
+        logger.info(note)
+        tg_send_message(note)
+        # 沒有入選清單就不更新 last_run.json（避免中斷基準）
+        return
+
+    # 4) 連續出現（以上一輪「成功產出」的交易日作為連續判定基準）
+    prev_run_trade_date_str = load_last_run_date()
+    streaks = load_streaks()  # { code: {"last_date": "YYYY-MM-DD", "streak": int} }
+    updated = {}
+    cont_days = []
+
+    for _, r in df_top.iterrows():
+        code = str(r["code"])
+        prev = streaks.get(code)
+        if prev and prev_run_trade_date_str and prev.get("last_date") == prev_run_trade_date_str:
+            days = int(prev.get("streak", 1)) + 1
+        else:
+            days = 1
+        cont_days.append(days)
+        updated[code] = {"last_date": tpe_today.isoformat(), "streak": days}
+
+    df_top["continuation_days"] = cont_days
+    save_streaks(updated)  # 只保留今日入選的檔，避免無限膨脹
+
+    # 5) 兩張表：連續 >=2 與 非連續
+    df_cont = df_top[df_top["continuation_days"] >= 2].copy()
+    df_single = df_top[df_top["continuation_days"] == 1].copy()
+
+    # 6) 輸出 CSV
+    cont_path = OUTPUT_DIR / f"continuous_{tpe_today.isoformat()}.csv"
+    single_path = OUTPUT_DIR / f"non_continuous_{tpe_today.isoformat()}.csv"
+    df_cont.to_csv(cont_path, index=False, encoding="utf-8-sig")
+    df_single.to_csv(single_path, index=False, encoding="utf-8-sig")
+
+    # 7) 更新 last_run.json（只在本輪有入選清單時才更新）
+    save_last_run_date(tpe_today)
+
+    # 8) 傳送 Telegram：摘要 + 附檔
+    def fmt_table(df: pd.DataFrame, title: str) -> str:
+        if df.empty:
+            return f"*{title}*: 無"
+        rows = [f"*{title}*（{len(df)} 檔）"]
+        for _, rr in df.iterrows():
+            rows.append(
+                f"`{rr['code']}`  收盤 {rr['close']:.2f}｜K/D {rr['K']:.1f}/{rr['D']:.1f}｜MA20 {rr['MA20']:.2f}｜連續 {rr['continuation_days']} 天"
+            )
+        return "\n".join(rows)
+
+    header = f"【{APP_NAME}】{tpe_today.isoformat()} 入選結果\n"
+    body = "\n\n".join([
+        fmt_table(df_cont, "連續兩天以上"),
+        fmt_table(df_single, "無連續出現"),
+    ])
+    tg_send_message(header + body)
+
+    # 附檔（CSV）
+    tg_send_document(cont_path, caption=f"{APP_NAME} 連續兩天以上")
+    tg_send_document(single_path, caption=f"{APP_NAME} 無連續出現")
+
+    logger.info("完成。連續≥2: %d，非連續: %d", len(df_cont), len(df_single))
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logger.exception("程式發生例外：%s", e)
+        # 發送錯誤通知（可選）
+        try:
+            tg_send_message(f"【{APP_NAME}】執行錯誤：{e}")
+        except Exception:
+            pass
+        sys.exit(1)
