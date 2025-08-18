@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+select# -*- coding: utf-8 -*-
 """
 twas_KD 主程式（無需 TA-Lib 版本）
 
@@ -142,21 +142,26 @@ def fetch_history(symbols: List[str], lookback_days: int = 180) -> Dict[str, pd.
     return out
 
 def calc_kd(df: pd.DataFrame, n: int = 14, k_smooth: int = 3, d_smooth: int = 3) -> pd.DataFrame:
-    """計算 Stochastic KD (n, k_smooth, d_smooth)，回傳含 K、D 欄位的 DataFrame"""
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    close = df["close"].astype(float)
+
     lowest_low = low.rolling(window=n, min_periods=n).min()
     highest_high = high.rolling(window=n, min_periods=n).max()
-    rsv = (close - lowest_low) / (highest_high - lowest_low)
-    rsv = rsv.clip(lower=0, upper=1)
+    denom = (highest_high - lowest_low)
 
-    K = rsv.ewm(alpha=1.0/k_smooth, adjust=False, min_periods=k_smooth).mean() * 100.0
-    D = K.ewm(alpha=1.0/d_smooth, adjust=False, min_periods=d_smooth).mean()
+    # 避免分母為 0（盤整區間最高=最低）：令 RSV=0.5
+    rsv = pd.Series(np.where(denom == 0, 0.5, (close - lowest_low) / denom), index=close.index)
+    rsv = pd.Series(np.clip(rsv, 0.0, 1.0), index=close.index)
+
+    K = rsv.ewm(alpha=1.0 / k_smooth, adjust=False, min_periods=k_smooth).mean() * 100.0
+    D = K.ewm(alpha=1.0 / d_smooth, adjust=False, min_periods=d_smooth).mean()
+
     out = df.copy()
     out["K"] = K
     out["D"] = D
     return out
+
 
 def moving_avg(series: pd.Series, n: int = 20) -> pd.Series:
     return series.rolling(n, min_periods=n).mean()
@@ -248,26 +253,35 @@ def select_candidates(hist: Dict[str, pd.DataFrame], params: RuleParams) -> pd.D
         df2["ma"] = moving_avg(df2["close"], params.ma_n)
         if df2["ma"].isna().all():
             continue
-        # 取最近兩天資料判斷交叉
+
         tail = df2.dropna().iloc[-2:]
         if tail.shape[0] < 2:
             continue
-        prev, last = tail.iloc[0], tail.iloc[1]
+        prev_row = tail.iloc[0]
+        last_row = tail.iloc[1]
 
-        # 黃金交叉（昨日 K<=D，今日 K>D）
-        golden_cross = (prev["K"] <= prev["D"]) and (last["K"] > last["D"])
-        kd_ok = (last["K"] < params.max_kd_level) and (last["D"] < params.max_kd_level)
-        ma_ok = last["close"] > last["ma"]
+        # --- 關鍵修正：先取純量再做比較，避免產生 Series 布林 ---
+        k_prev = float(prev_row["K"])
+        d_prev = float(prev_row["D"])
+        k_last = float(last_row["K"])
+        d_last = float(last_row["D"])
+        close_last = float(last_row["close"])
+        ma_last = float(last_row["ma"])
+
+        golden_cross = (k_prev <= d_prev) and (k_last > d_last)
+        kd_ok = (k_last < params.max_kd_level) and (d_last < params.max_kd_level)
+        ma_ok = close_last > ma_last
 
         if golden_cross and kd_ok and ma_ok:
             rows.append({
                 "code": code,
-                "date": last.name.date().isoformat(),
-                "close": round(float(last["close"]), 2),
-                "K": round(float(last["K"]), 2),
-                "D": round(float(last["D"]), 2),
-                "MA20": round(float(last["ma"]), 2),
+                "date": last_row.name.date().isoformat(),
+                "close": round(close_last, 2),
+                "K": round(k_last, 2),
+                "D": round(d_last, 2),
+                "MA20": round(ma_last, 2),
             })
+
     df_out = pd.DataFrame(rows)
     if not df_out.empty:
         df_out = df_out.sort_values(by=["code"]).reset_index(drop=True)
