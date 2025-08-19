@@ -1,117 +1,43 @@
-name: TWSE KD Screener (Daily 13:40 TPE)
-
-# 允許把 history/ 檔案推回 repo
-permissions:
-  contents: write
+name: TWAS KD Daily Screener
 
 on:
   schedule:
-    # 台北 UTC+8，13:40 => 05:40 UTC；僅週一~週五
+    # 台北 13:40 = UTC 05:40，週一到週五
     - cron: "40 5 * * 1-5"
   workflow_dispatch:
 
 jobs:
-  run-screener:
+  run:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0            # 需要完整歷史，push 才不會出問題
-          persist-credentials: true # 用 GITHUB_TOKEN 推回來
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
-
-      - name: Create .env for this run
-        # 這裡把 Telegram 的 secrets 寫進 .env（若你沒設，會是空字串，程式內會自動跳過發送）
-        run: |
-          cat > .env << 'EOF'
-          # === 通知設定 ===
-          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
-
-          # === 參數（可依需求調整）===
-          TOP_N=20
-
-          KD_N=9
-          KD_K_SMOOTH=3
-          KD_D_PERIOD=3
-          KD_CROSS_WINDOW=3
-          KD_REQUIRE_ZONE=false
-          KD_ZONE_LOW=40
-          KD_ZONE_HIGH=80
-
-          VOLUME_LOOKBACK=20
-          VOLUME_MULTIPLIER=1.5
-
-          # 規則開關
-          ENABLE_RULE_BLACK_CANDLE_LIMIT=true
-          BLACK_CANDLE_MAX_DROP=0.95
-          ENABLE_RULE_OC_ABOVE_MA20=true
-          ENABLE_RULE_LAST5_MA10_THRESHOLD=true
-          MAX_DAYS_BELOW_MA10_IN_5=3
-          ENABLE_RULE_MA5_GT_MA20=true
-
-          # 流通性門檻（最近10日每日至少百萬股）
-          LIQ_10D_EACH_MIN=1000000
-
-          # 市值門檻
-          MARKET_CAP_MIN=10000000000
-
-          # Yahoo 下載批次大小
-          BATCH_SIZE=120
-          EOF
-          echo "Generated .env:"
-          sed 's/^\(TELEGRAM_.*=\).*/\1****/g' .env | sed 's/^\(SMTP_.*=\).*/\1****/g'
 
       - name: Install dependencies
         run: |
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            # 備用：若沒有 requirements.txt 就裝常用套件
-            pip install pandas numpy requests python-dotenv lxml yfinance
-          fi
+          python -m pip install --upgrade pip
+          pip install yfinance pandas numpy requests
 
       - name: Run screener
-        run: python src/main.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python src/main.py
+          ls -al output || true
 
-      - name: Upload CSV artifact
-        if: always()
+      - name: Upload CSVs (if any)
+        if: ${{ hashFiles('output/*.csv') != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: picks-${{ github.run_id }}
-          path: |
-            output/*.csv
-          retention-days: 14
-
-      - name: Save & commit today's picks into repo history
-        if: always()
-        run: |
-          set -e
-          DATE_TPE=$(TZ=Asia/Taipei date +%Y%m%d)
-          mkdir -p history
-
-          # 優先找當日檔名；沒有就用最新一個
-          if [ -f "output/picks_${DATE_TPE}.csv" ]; then
-            SRC="output/picks_${DATE_TPE}.csv"
-          else
-            SRC=$(ls -t output/picks_*.csv 2>/dev/null | head -n1 || true)
-          fi
-
-          if [ -n "$SRC" ] && [ -f "$SRC" ]; then
-            cp -f "$SRC" "history/picks_${DATE_TPE}.csv"
-
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add "history/picks_${DATE_TPE}.csv"
-            git commit -m "history: update ${DATE_TPE}" || echo "Nothing to commit"
-            git push
-          else
-            echo "No picks CSV found to archive. Skip committing history."
-          fi
+          name: picks-${{ github.run_number }}
+          path: output/*.csv
