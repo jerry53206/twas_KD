@@ -11,12 +11,6 @@ twas_KD 主程式（無需 TA-Lib 版本）
 環境變數
 - TELEGRAM_BOT_TOKEN
 - TELEGRAM_CHAT_ID
-
-檔案
-- universe.csv：可選。一行一個代碼（不含 .TW/.TWO；若要上櫃，建議直接寫 6488.TWO）
-- state/streaks.json：每檔最後入選日與連續天數
-- state/last_run.json：上一輪成功執行的交易日
-- output/*.csv：輸出結果
 """
 
 import os
@@ -41,14 +35,11 @@ OUTPUT_DIR = ROOT / "output"
 STATE_DIR.mkdir(exist_ok=True, parents=True)
 OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
-# 時區（統一用台北日期計算）
 TZ_OFFSET_HOURS = 8  # Asia/Taipei (UTC+8)
 
-# Telegram
 TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-# 日誌
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -58,40 +49,35 @@ logger = logging.getLogger(APP_NAME)
 
 # ---------- 共用小工具 ----------
 def _ensure_series(x: Union[pd.Series, pd.DataFrame], index=None) -> pd.Series:
-    """把單欄 DataFrame/Series 都轉成 1D Series（float），保持索引對齊。"""
+    """把單欄 DataFrame/Series 統一成 1D Series（float），保持索引對齊。"""
     if isinstance(x, pd.DataFrame):
-        x = x.iloc[:, 0]
+        if x.shape[1] == 1:
+            x = x.iloc[:, 0]
+        else:
+            x = x.squeeze(axis=1)
     s = pd.to_numeric(pd.Series(x, index=index if index is not None else getattr(x, "index", None)), errors="coerce")
     return s
 
 # ---------- 工具函式 ----------
 def today_taipei() -> date:
-    """以 UTC +8 取得台北當地日期"""
     return (datetime.utcnow() + timedelta(hours=TZ_OFFSET_HOURS)).date()
 
 def y_to_tw_symbol(code: str) -> str:
-    """
-    將 4 位數台股代碼轉為 yfinance 代碼。
-    若 CSV 已填 .TW/.TWO 就原樣使用；否則預設附上 .TW（若需上櫃請在 universe.csv 直接寫 6488.TWO）。
-    """
     if code.endswith(".TW") or code.endswith(".TWO"):
         return code
     return f"{code}.TW"
 
 def safe_read_universe() -> List[str]:
-    """讀取 universe.csv；若不存在則用預設股池"""
     csv_path = ROOT / "universe.csv"
     if csv_path.exists():
         s = []
         for line in csv_path.read_text(encoding="utf-8").splitlines():
             line = line.strip().strip(",")
-            if not line:
-                continue
-            s.append(line)
+            if line:
+                s.append(line)
         if s:
             logger.info("使用 universe.csv：%d 檔", len(s))
             return s
-    # 預設股池（可自行調整）
     default = [
         "2330", "2317", "2454", "2308", "2382", "2412", "2303", "2881", "2882", "2884",
         "2886", "2357", "1216", "2885", "3231", "3034", "2379", "6669", "5880", "2383",
@@ -101,7 +87,6 @@ def safe_read_universe() -> List[str]:
     return default
 
 def fetch_last_trade_date_of(symbol: str, period_days: int = 7) -> Optional[date]:
-    """抓指定標的最近一筆收盤日期（轉為台北日期）"""
     try:
         df = yf.download(symbol, period=f"{period_days}d", interval="1d", auto_adjust=False, progress=False)
         if df is None or df.empty:
@@ -115,7 +100,6 @@ def fetch_last_trade_date_of(symbol: str, period_days: int = 7) -> Optional[date
         return None
 
 def fetch_history(symbols: List[str], lookback_days: int = 180) -> Dict[str, pd.DataFrame]:
-    """以 yfinance 抓多檔日線資料"""
     out = {}
     for s in symbols:
         ys = y_to_tw_symbol(s)
@@ -143,7 +127,8 @@ def fetch_history(symbols: List[str], lookback_days: int = 180) -> Dict[str, pd.
 def calc_kd(df: pd.DataFrame, n: int = 14, k_smooth: int = 3, d_smooth: int = 3) -> pd.DataFrame:
     """
     計算 Stochastic KD (n, k_smooth, d_smooth)。
-    全 Pandas 寫法避免 ndarray 形狀 (N,1) 問題；盤整時（最高=最低）令 RSV=0.5。
+    以純 Pandas 寫法產出 1D Series，避免 (N,1) ndarray 造成的 1-D 限制錯誤。
+    盤整（最高=最低）處以 RSV=0.5。
     """
     high = _ensure_series(df["high"], index=df.index)
     low = _ensure_series(df["low"], index=df.index)
@@ -153,16 +138,16 @@ def calc_kd(df: pd.DataFrame, n: int = 14, k_smooth: int = 3, d_smooth: int = 3)
     highest_high = high.rolling(window=n, min_periods=n).max()
     denom = highest_high - lowest_low
 
-    rsv = (close - lowest_low) / denom
-    rsv = rsv.where(denom != 0, 0.5)  # 分母為 0 => 0.5
-    rsv = rsv.clip(lower=0.0, upper=1.0)
+    rsv = (close - lowest_low).div(denom)           # 先照常計算
+    rsv = rsv.where(denom != 0, 0.5)                # 分母為 0 的位置改為 0.5
+    rsv = rsv.clip(lower=0.0, upper=1.0)            # 夾限 0~1
 
     K = rsv.ewm(alpha=1.0 / k_smooth, adjust=False, min_periods=k_smooth).mean() * 100.0
     D = K.ewm(alpha=1.0 / d_smooth, adjust=False, min_periods=d_smooth).mean()
 
     out = df.copy()
-    out["K"] = K
-    out["D"] = D
+    out["K"] = _ensure_series(K, index=df.index)
+    out["D"] = _ensure_series(D, index=df.index)
     return out
 
 def moving_avg(x: Union[pd.Series, pd.DataFrame], n: int = 20) -> pd.Series:
@@ -206,10 +191,7 @@ def tg_send_message(text: str, parse_mode: Optional[str] = "Markdown") -> None:
         logger.info("未設定 Telegram 環境變數，略過傳訊息。")
         return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TG_CHAT_ID,
-        "text": text,
-    }
+    payload = {"chat_id": TG_CHAT_ID, "text": text}
     if parse_mode:
         payload["parse_mode"] = parse_mode
         payload["disable_web_page_preview"] = True
@@ -243,13 +225,9 @@ class RuleParams:
     kd_k: int = 3
     kd_d: int = 3
     ma_n: int = 20
-    # 入選條件：KD 黃金交叉且 K、D < 50，並且收盤 > MA20
-    max_kd_level: float = 50.0
+    max_kd_level: float = 50.0  # K、D < 50
 
 def select_candidates(hist: Dict[str, pd.DataFrame], params: RuleParams) -> pd.DataFrame:
-    """
-    依規則選股；強制轉純量避免布林歧義。
-    """
     rows = []
     for code, df in hist.items():
         if df.shape[0] < max(params.kd_n, params.ma_n) + 5:
@@ -265,15 +243,11 @@ def select_candidates(hist: Dict[str, pd.DataFrame], params: RuleParams) -> pd.D
         prev_row = tail.iloc[0]
         last_row = tail.iloc[1]
 
-        # 強制轉純量
-        k_prev = float(prev_row["K"])
-        d_prev = float(prev_row["D"])
-        k_last = float(last_row["K"])
-        d_last = float(last_row["D"])
-        close_last = float(last_row["close"])
-        ma_last = float(last_row["ma"])
+        # 取純量
+        k_prev = float(prev_row["K"]); d_prev = float(prev_row["D"])
+        k_last = float(last_row["K"]);  d_last = float(last_row["D"])
+        close_last = float(last_row["close"]); ma_last = float(last_row["ma"])
 
-        # 入選條件
         golden_cross = (k_prev <= d_prev) and (k_last > d_last)
         kd_ok = (k_last < params.max_kd_level) and (d_last < params.max_kd_level)
         ma_ok = close_last > ma_last
@@ -298,7 +272,7 @@ def main():
     tpe_today = today_taipei()
     logger.info("台北日期：%s", tpe_today.isoformat())
 
-    # 1) 判斷是否為交易日（以 2330.TW 最新收盤日期是否等於今日）
+    # 1) 判斷是否為交易日
     last_tsmc_date = fetch_last_trade_date_of("2330.TW", period_days=10)
     if last_tsmc_date != tpe_today:
         msg = f"【{APP_NAME}】{tpe_today.isoformat()} 今日為非交易日，請開心過好每一天。"
@@ -306,10 +280,9 @@ def main():
         tg_send_message(msg)
         return
 
-    # 2) 下載股池歷史資料
+    # 2) 抓資料
     universe = safe_read_universe()
     hist = fetch_history(universe, lookback_days=220)
-
     if not hist:
         warn = f"【{APP_NAME}】{tpe_today.isoformat()} 今日資料抓取失敗（股池無資料）。"
         logger.warning(warn)
@@ -319,17 +292,15 @@ def main():
     # 3) 規則選股
     params = RuleParams()
     df_top = select_candidates(hist, params)
-
     if df_top.empty:
         note = f"【{APP_NAME}】{tpe_today.isoformat()} 今日無入選標的。"
         logger.info(note)
         tg_send_message(note)
-        # 沒有入選清單就不更新 last_run.json（避免中斷基準）
-        return
+        return  # 無清單則不更新 last_run.json
 
-    # 4) 連續出現（以上一輪「成功產出」的交易日作為連續判定基準）
+    # 4) 連續出現（以上一輪成功產出的交易日為基準）
     prev_run_trade_date_str = load_last_run_date()
-    streaks = load_streaks()  # { code: {"last_date": "YYYY-MM-DD", "streak": int} }
+    streaks = load_streaks()  # { code: {"last_date":"YYYY-MM-DD","streak":int} }
     updated = {}
     cont_days = []
 
@@ -344,9 +315,9 @@ def main():
         updated[code] = {"last_date": tpe_today.isoformat(), "streak": days}
 
     df_top["continuation_days"] = cont_days
-    save_streaks(updated)  # 只保留今日入選的檔，避免無限膨脹
+    save_streaks(updated)
 
-    # 5) 兩張表：連續 >=2 與 非連續
+    # 5) 兩張表
     df_cont = df_top[df_top["continuation_days"] >= 2].copy()
     df_single = df_top[df_top["continuation_days"] == 1].copy()
 
@@ -356,10 +327,10 @@ def main():
     df_cont.to_csv(cont_path, index=False, encoding="utf-8-sig")
     df_single.to_csv(single_path, index=False, encoding="utf-8-sig")
 
-    # 7) 更新 last_run.json（只在本輪有入選清單時才更新）
+    # 7) 更新 last_run.json（僅在有入選時）
     save_last_run_date(tpe_today)
 
-    # 8) 傳送 Telegram：摘要 + 附檔
+    # 8) Telegram 摘要 + 附檔
     def fmt_table(df: pd.DataFrame, title: str) -> str:
         if df.empty:
             return f"*{title}*: 無"
@@ -367,30 +338,3 @@ def main():
         for _, rr in df.iterrows():
             rows.append(
                 f"`{rr['code']}`  收盤 {rr['close']:.2f}｜K/D {rr['K']:.1f}/{rr['D']:.1f}｜MA20 {rr['MA20']:.2f}｜連續 {rr['continuation_days']} 天"
-            )
-        return "\n".join(rows)
-
-    header = f"【{APP_NAME}】{tpe_today.isoformat()} 入選結果\n"
-    body = "\n\n".join([
-        fmt_table(df_cont, "連續兩天以上"),
-        fmt_table(df_single, "無連續出現"),
-    ])
-    tg_send_message(header + body)
-
-    # 附檔（CSV）
-    tg_send_document(cont_path, caption=f"{APP_NAME} 連續兩天以上")
-    tg_send_document(single_path, caption=f"{APP_NAME} 無連續出現")
-
-    logger.info("完成。連續≥2: %d，非連續: %d", len(df_cont), len(df_single))
-
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        logger.exception("程式發生例外：%s", e)
-        # 發送錯誤通知（可選）
-        try:
-            tg_send_message(f"【{APP_NAME}】執行錯誤：{e}")
-        except Exception:
-            pass
-        sys.exit(1)
