@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-twas_KD 主程式（無需 TA-Lib 版本）
+twas_KD 主程式（無需 TA-Lib）
 
-功能概述
-1) 以 2330.TW 判斷今日(Asia/Taipei)是否有最新收盤資料：若無 => 傳「今日為非交易日…」並結束。
-2) 下載股池歷史資料，計算 KD(14,3,3) 與 MA20，依規則選股。
-3) 以「上一輪成功執行的交易日」判定是否連續出現（支援隔週/連假/漏跑不中斷）。
-4) 產出兩張表：連續≥2 與 非連續，輸出 CSV；Telegram 傳摘要並附檔。
+重點功能
+1) 以 2330.TW 判斷今日(Asia/Taipei)是否為交易日，若非交易日→照樣輸出「空白 CSV」並傳訊息。
+2) 下載股池，計算 KD(14,3,3) 與 MA20，依規則選股（黃金交叉、K/D<50、收盤>MA20）。
+3) 以「上一輪成功產出生效的交易日」判定連續出現（支援隔週/連假/漏跑）。
+4) 產出兩張表：連續≥2 與 非連續；一定會有 output/*.csv（空或有資料皆可上傳）。
+5) 單一 Telegram 帳號通知（用 TELEGRAM_BOT_TOKEN、TELEGRAM_CHAT_ID）。
 
 環境變數
 - TELEGRAM_BOT_TOKEN
@@ -29,7 +30,10 @@ import yfinance as yf
 
 # ---------- 基本設定 ----------
 APP_NAME = "twas_KD"
-ROOT = Path(__file__).resolve().parent
+
+# 把輸出寫在「倉庫根目錄」，避免 artifact 路徑不一致
+# 假設本檔位於 repo/src/main.py
+ROOT = Path(__file__).resolve().parents[1]  # 倉庫根目錄
 STATE_DIR = ROOT / "state"
 OUTPUT_DIR = ROOT / "output"
 STATE_DIR.mkdir(exist_ok=True, parents=True)
@@ -58,7 +62,6 @@ def _ensure_series(x: Union[pd.Series, pd.DataFrame], index=None) -> pd.Series:
     s = pd.to_numeric(pd.Series(x, index=index if index is not None else getattr(x, "index", None)), errors="coerce")
     return s
 
-# ---------- 工具函式 ----------
 def today_taipei() -> date:
     return (datetime.utcnow() + timedelta(hours=TZ_OFFSET_HOURS)).date()
 
@@ -126,9 +129,7 @@ def fetch_history(symbols: List[str], lookback_days: int = 180) -> Dict[str, pd.
 
 def calc_kd(df: pd.DataFrame, n: int = 14, k_smooth: int = 3, d_smooth: int = 3) -> pd.DataFrame:
     """
-    計算 Stochastic KD (n, k_smooth, d_smooth)。
-    以純 Pandas 寫法產出 1D Series，避免 (N,1) ndarray 造成的 1-D 限制錯誤。
-    盤整（最高=最低）處以 RSV=0.5。
+    計算 Stochastic KD；純 Pandas 寫法（1D Series），盤整(最高=最低)令 RSV=0.5。
     """
     high = _ensure_series(df["high"], index=df.index)
     low = _ensure_series(df["low"], index=df.index)
@@ -139,8 +140,7 @@ def calc_kd(df: pd.DataFrame, n: int = 14, k_smooth: int = 3, d_smooth: int = 3)
     denom = highest_high - lowest_low
 
     rsv = (close - lowest_low).div(denom)
-    rsv = rsv.where(denom != 0, 0.5)
-    rsv = rsv.clip(lower=0.0, upper=1.0)
+    rsv = rsv.where(denom != 0, 0.5).clip(lower=0.0, upper=1.0)
 
     K = rsv.ewm(alpha=1.0 / k_smooth, adjust=False, min_periods=k_smooth).mean() * 100.0
     D = K.ewm(alpha=1.0 / d_smooth, adjust=False, min_periods=d_smooth).mean()
@@ -184,6 +184,18 @@ def load_last_run_date() -> Optional[str]:
 
 def save_last_run_date(trade_date: date) -> None:
     save_json(LAST_RUN_PATH, {"last_trade_date": trade_date.isoformat()})
+
+# ---------- 永遠產出 CSV（空檔也會有） ----------
+def write_placeholder_csvs(run_date: date, reason: str = "") -> None:
+    """輸出兩份空白 CSV（只有標題列），避免 artifact 步驟找不到檔案。"""
+    cols = ["code", "date", "close", "K", "D", "MA20", "continuation_days"]
+    empty = pd.DataFrame(columns=cols)
+    cont_path = OUTPUT_DIR / f"continuous_{run_date.isoformat()}.csv"
+    single_path = OUTPUT_DIR / f"non_continuous_{run_date.isoformat()}.csv"
+    empty.to_csv(cont_path, index=False, encoding="utf-8-sig")
+    empty.to_csv(single_path, index=False, encoding="utf-8-sig")
+    if reason:
+        logger.info("已輸出空白 CSV（原因：%s） -> %s, %s", reason, cont_path.name, single_path.name)
 
 # ---------- 通知 ----------
 def tg_send_message(text: str, parse_mode: Optional[str] = "Markdown") -> None:
@@ -272,21 +284,23 @@ def main():
     tpe_today = today_taipei()
     logger.info("台北日期：%s", tpe_today.isoformat())
 
-    # 1) 判斷是否為交易日
+    # 1) 判斷是否為交易日（以 2330.TW 最新收盤日期是否等於今日）
     last_tsmc_date = fetch_last_trade_date_of("2330.TW", period_days=10)
     if last_tsmc_date != tpe_today:
         msg = f"【{APP_NAME}】{tpe_today.isoformat()} 今日為非交易日，請開心過好每一天。"
         logger.info(msg)
         tg_send_message(msg)
+        write_placeholder_csvs(tpe_today, "非交易日")
         return
 
-    # 2) 抓資料
+    # 2) 下載股池歷史資料
     universe = safe_read_universe()
     hist = fetch_history(universe, lookback_days=220)
     if not hist:
         warn = f"【{APP_NAME}】{tpe_today.isoformat()} 今日資料抓取失敗（股池無資料）。"
         logger.warning(warn)
         tg_send_message(warn)
+        write_placeholder_csvs(tpe_today, "抓不到股池資料")
         return
 
     # 3) 規則選股
@@ -296,6 +310,7 @@ def main():
         note = f"【{APP_NAME}】{tpe_today.isoformat()} 今日無入選標的。"
         logger.info(note)
         tg_send_message(note)
+        write_placeholder_csvs(tpe_today, "無入選")
         return  # 無清單則不更新 last_run.json
 
     # 4) 連續出現（以上一輪成功產出的交易日為基準）
