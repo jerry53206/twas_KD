@@ -138,9 +138,9 @@ def calc_kd(df: pd.DataFrame, n: int = 14, k_smooth: int = 3, d_smooth: int = 3)
     highest_high = high.rolling(window=n, min_periods=n).max()
     denom = highest_high - lowest_low
 
-    rsv = (close - lowest_low).div(denom)           # 先照常計算
-    rsv = rsv.where(denom != 0, 0.5)                # 分母為 0 的位置改為 0.5
-    rsv = rsv.clip(lower=0.0, upper=1.0)            # 夾限 0~1
+    rsv = (close - lowest_low).div(denom)
+    rsv = rsv.where(denom != 0, 0.5)
+    rsv = rsv.clip(lower=0.0, upper=1.0)
 
     K = rsv.ewm(alpha=1.0 / k_smooth, adjust=False, min_periods=k_smooth).mean() * 100.0
     D = K.ewm(alpha=1.0 / d_smooth, adjust=False, min_periods=d_smooth).mean()
@@ -336,5 +336,33 @@ def main():
             return f"*{title}*: 無"
         rows = [f"*{title}*（{len(df)} 檔）"]
         for _, rr in df.iterrows():
-            rows.append(
-                f"`{rr['code']}`  收盤 {rr['close']:.2f}｜K/D {rr['K']:.1f}/{rr['D']:.1f}｜MA20 {rr['MA20']:.2f}｜連續 {rr['continuation_days']} 天"
+            line = "`{code}`  收盤 {close:.2f}｜K/D {K:.1f}/{D:.1f}｜MA20 {ma:.2f}｜連續 {days} 天".format(
+                code=rr["code"],
+                close=float(rr["close"]),
+                K=float(rr["K"]),
+                D=float(rr["D"]),
+                ma=float(rr["MA20"]),
+                days=int(rr["continuation_days"]),
+            )
+            rows.append(line)
+        return "\n".join(rows)
+
+    header = f"【{APP_NAME}】{tpe_today.isoformat()} 入選結果\n"
+    body = "\n\n".join([fmt_table(df_cont, "連續兩天以上"), fmt_table(df_single, "無連續出現")])
+    tg_send_message(header + body)
+
+    tg_send_document(cont_path, caption=f"{APP_NAME} 連續兩天以上")
+    tg_send_document(single_path, caption=f"{APP_NAME} 無連續出現")
+
+    logger.info("完成。連續≥2: %d，非連續: %d", len(df_cont), len(df_single))
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logger.exception("程式發生例外：%s", e)
+        try:
+            tg_send_message(f"【{APP_NAME}】執行錯誤：{e}")
+        except Exception:
+            pass
+        sys.exit(1)
