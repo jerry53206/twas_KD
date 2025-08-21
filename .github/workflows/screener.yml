@@ -1,43 +1,98 @@
-name: TWAS KD Daily Screener
+name: TWSE & TPEX KD Screener (Daily 13:40 TPE)
 
 on:
   schedule:
-    # 台北 13:40 = UTC 05:40，週一到週五
-    - cron: "40 5 * * 1-5"
-  workflow_dispatch:
+    - cron: "40 5 * * 1-5" # 台北13:40=UTC05:40，週一到週五
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
 
 jobs:
-  run:
+  run-screener:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      actions: read
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
+
+      - name: Create .env for this run
+        run: |
+          cat > .env << 'EOF'
+          TELEGRAM_BOT_TOKEN=${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID=${{ secrets.TELEGRAM_CHAT_ID }}
+
+          # —— 參數（可依需求調整）——
+          TOP_N=20
+
+          KD_N=9
+          KD_K_SMOOTH=3
+          KD_D_PERIOD=3
+          KD_CROSS_WINDOW=3
+          KD_REQUIRE_ZONE=false
+          KD_ZONE_LOW=40
+          KD_ZONE_HIGH=80
+
+          # 量能與流動性
+          VOLUME_LOOKBACK=20
+          VOLUME_MULTIPLIER=1.5
+          LIQ_MIN_VOL_LAST10=1000000
+
+          # 結構限制
+          ENABLE_RULE_BLACK_CANDLE_LIMIT=true
+          BLACK_CANDLE_MAX_DROP=0.95
+          ENABLE_RULE_OC_ABOVE_MA20=true
+          ENABLE_RULE_LAST5_MA10_THRESHOLD=true
+          MAX_DAYS_BELOW_MA10_IN_5=3
+          ENABLE_RULE_MA5_GT_MA20=true
+
+          # 市值
+          MARKET_CAP_MIN=10000000000
+
+          # 其他
+          BATCH_SIZE=120
+          CONTINUATION_KEY=yahoo
+          INCLUDE_TPEX=true
+          EOF
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install yfinance pandas numpy requests
+          pip install --upgrade pip
+          pip install yfinance pandas numpy requests python-dotenv lxml
 
       - name: Run screener
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python src/main.py
-          ls -al output || true
+        run: python src/main.py
 
-      - name: Upload CSVs (if any)
-        if: ${{ hashFiles('output/*.csv') != '' }}
+      - name: Upload CSV artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: picks-${{ github.run_number }}
+          name: picks-${{ github.run_id }}
           path: output/*.csv
+          retention-days: 14
+
+      - name: Save streaks back to repo
+        if: always()
+        run: |
+          if [ -f state/streaks.json ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            if [ -n "$(git status --porcelain=state/streaks.json)" ]; then
+              git add state/streaks.json
+              git commit -m "chore: update streaks for $GITHUB_RUN_ID [skip ci]"
+              git push
+            else
+              echo "No streak changes."
+            fi
+          else
+            echo "state/streaks.json not found, nothing to save."
+          fi
