@@ -2,586 +2,521 @@
 # -*- coding: utf-8 -*-
 
 import os
-import json
+import sys
 import time
 import math
 import logging
 import traceback
-from io import StringIO
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
-from datetime import datetime, date
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None  # Py>=3.9 皆有，保險處理
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-import requests
-import yfinance as yf
+import pytz
 from dotenv import load_dotenv
 
-# ----------------- 基本設定 -----------------
+# ----------------- 專案內模組 -----------------
+from universe.twse_listed import fetch_twse_listed_equities
+from data_sources.yahoo import download_ohlcv_batches
+from data_sources.yahoo_meta import get_market_caps
+from indicators.ta import stochastic_kd
+
+# Telegram 發送（若無 notify.telegram 模組則用後援）
+try:
+    from notify.telegram import send_telegram_message  # def send_telegram_message(bot_token, chat_id, text)
+except Exception:
+    import requests
+    def send_telegram_message(bot_token: str, chat_id: str, text: str):
+        try:
+            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+            r = requests.post(url, data={"chat_id": chat_id, "text": text})
+            r.raise_for_status()
+        except Exception as e:
+            raise RuntimeError(f"Telegram API error: {e}")
+
+# ----------------- 目錄與記錄 -----------------
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = ROOT / "output"
 LOG_DIR = ROOT / "logs"
-STATE_DIR = ROOT / "state"
+HISTORY_DIR = ROOT / "history"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_DIR / "app.log", encoding="utf-8"),
-        logging.StreamHandler()
-    ],
+    handlers=[logging.FileHandler(LOG_DIR / "app.log", encoding="utf-8"),
+              logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("tdcc_kd_screener")
+logger = logging.getLogger("twse_kd_screener")
 
 
-# ----------------- 參數 -----------------
-def _get_bool(val: Optional[str], default: bool) -> bool:
-    if val is None:
-        return default
-    return str(val).strip().lower() in {"1", "true", "t", "y", "yes"}
-
-def get_env_params() -> dict:
+# ----------------- 讀取 .env 參數 -----------------
+def get_env_params() -> Dict:
     load_dotenv(ROOT / ".env", override=True)
-
     params = dict(
-        TOP_N=int(os.getenv("TOP_N", "20")),
-
+        # KD
         KD_N=int(os.getenv("KD_N", "9")),
         KD_K_SMOOTH=int(os.getenv("KD_K_SMOOTH", "3")),
         KD_D_PERIOD=int(os.getenv("KD_D_PERIOD", "3")),
         KD_CROSS_WINDOW=int(os.getenv("KD_CROSS_WINDOW", "3")),
-        KD_REQUIRE_ZONE=_get_bool(os.getenv("KD_REQUIRE_ZONE", "false"), False),
+        KD_REQUIRE_ZONE=os.getenv("KD_REQUIRE_ZONE", "false").lower() == "true",
         KD_ZONE_LOW=float(os.getenv("KD_ZONE_LOW", "40")),
         KD_ZONE_HIGH=float(os.getenv("KD_ZONE_HIGH", "80")),
 
+        # Volume today vs 20-day avg
         VOLUME_LOOKBACK=int(os.getenv("VOLUME_LOOKBACK", "20")),
         VOLUME_MULTIPLIER=float(os.getenv("VOLUME_MULTIPLIER", "1.5")),
-        LIQ_MIN_VOL_LAST10=int(os.getenv("LIQ_MIN_VOL_LAST10", "1000000")),
 
-        ENABLE_RULE_BLACK_CANDLE_LIMIT=_get_bool(os.getenv("ENABLE_RULE_BLACK_CANDLE_LIMIT", "true"), True),
-        BLACK_CANDLE_MAX_DROP=float(os.getenv("BLACK_CANDLE_MAX_DROP", "0.95")),
-        ENABLE_RULE_OC_ABOVE_MA20=_get_bool(os.getenv("ENABLE_RULE_OC_ABOVE_MA20", "true"), True),
-        ENABLE_RULE_LAST5_MA10_THRESHOLD=_get_bool(os.getenv("ENABLE_RULE_LAST5_MA10_THRESHOLD", "true"), True),
+        # 10日流動性下限（每日皆 >= 100萬股）
+        MIN_DAILY_VOLUME_10D=int(os.getenv("MIN_DAILY_VOLUME_10D", "1000000")),
+
+        # 價格/MAs 規則
+        ENABLE_RULE_BLACK_CANDLE_LIMIT=os.getenv("ENABLE_RULE_BLACK_CANDLE_LIMIT", "true").lower() == "true",
+        BLACK_CANDLE_MAX_DROP=float(os.getenv("BLACK_CANDLE_MAX_DROP", "0.95")),  # 收黑K時 C >= O*0.95
+        ENABLE_RULE_OC_ABOVE_MA20=os.getenv("ENABLE_RULE_OC_ABOVE_MA20", "true").lower() == "true",
+        ENABLE_RULE_LAST5_MA10_THRESHOLD=os.getenv("ENABLE_RULE_LAST5_MA10_THRESHOLD", "true").lower() == "true",
         MAX_DAYS_BELOW_MA10_IN_5=int(os.getenv("MAX_DAYS_BELOW_MA10_IN_5", "3")),
-        ENABLE_RULE_MA5_GT_MA20=_get_bool(os.getenv("ENABLE_RULE_MA5_GT_MA20", "true"), True),
+        ENABLE_RULE_MA5_GT_MA20=os.getenv("ENABLE_RULE_MA5_GT_MA20", "true").lower() == "true",
 
-        MARKET_CAP_MIN=float(os.getenv("MARKET_CAP_MIN", "10000000000")),
+        # 市值
+        MARKET_CAP_MIN=float(os.getenv("MARKET_CAP_MIN", "10000000000")),  # 100億
 
+        # 取資料
         BATCH_SIZE=int(os.getenv("BATCH_SIZE", "120")),
-        CONTINUATION_KEY=os.getenv("CONTINUATION_KEY", "yahoo"),
-        INCLUDE_TPEX=_get_bool(os.getenv("INCLUDE_TPEX", "true"), True),
 
-        TELEGRAM_BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
-        TELEGRAM_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+        # 排名與輸出
+        TOP_N=int(os.getenv("TOP_N", "20")),
+
+        # 通知
+        TELEGRAM_BOT_TOKEN=os.getenv("TELEGRAM_BOT_TOKEN"),
+        TELEGRAM_CHAT_ID=os.getenv("TELEGRAM_CHAT_ID"),
     )
-
+    zone_flag = "ON" if params["KD_REQUIRE_ZONE"] else "OFF"
     logger.info(
-        "Params loaded: KD=(%d,%d,%d), window=%d, zone=%s[%g~%g], "
-        "VOL: N=%d x%.2f, LIQ10=%d, TOP_N=%d, MCAP_MIN=%g, TPEX=%s",
-        params["KD_N"], params["KD_K_SMOOTH"], params["KD_D_PERIOD"],
-        params["KD_CROSS_WINDOW"],
-        "ON" if params["KD_REQUIRE_ZONE"] else "OFF",
-        params["KD_ZONE_LOW"], params["KD_ZONE_HIGH"],
+        "Params loaded: KD=(%d,%d,%d), window=%d, zone=%s[%.0f~%.0f], VOL: N=%d x%.2f, "
+        "MIN_VOL_10D=%d, TOP_N=%d, MCAP_MIN=%d",
+        params["KD_N"], params["KD_K_SMOOTH"], params["KD_D_PERIOD"], params["KD_CROSS_WINDOW"],
+        zone_flag, params["KD_ZONE_LOW"], params["KD_ZONE_HIGH"],
         params["VOLUME_LOOKBACK"], params["VOLUME_MULTIPLIER"],
-        params["LIQ_MIN_VOL_LAST10"],
-        params["TOP_N"], params["MARKET_CAP_MIN"],
-        params["INCLUDE_TPEX"]
+        params["MIN_DAILY_VOLUME_10D"], params["TOP_N"], int(params["MARKET_CAP_MIN"])
     )
     return params
 
 
-# ----------------- 上市/上櫃清單 -----------------
-EXCLUDE_KEYWORDS = (
-    "受益|ETF|基金|購|售|權證|公司債|可轉債|交換債|受益憑證|特別股|存託憑證|不動產|REIT|期貨|選擇權|ETN"
-)
+# ----------------- 工具 -----------------
+def today_str_tpe() -> str:
+    tz = pytz.timezone("Asia/Taipei")
+    return datetime.now(tz).strftime("%Y%m%d")
 
-def _fetch_isin_table(url: str) -> pd.DataFrame:
-    resp = requests.get(url, timeout=30)
-    resp.encoding = resp.apparent_encoding or "utf-8"
-    tables = pd.read_html(StringIO(resp.text))
-    # 找到含「有價證券代號及名稱」的那張表
-    target = None
-    for t in tables:
-        cols = [str(c) for c in t.columns]
-        if any("有價證券代號及名稱" in str(c) for c in cols):
-            target = t.copy()
-            break
-    if target is None:
-        raise RuntimeError("ISIN 表格結構可能變動，找不到『有價證券代號及名稱』欄。")
-    return target
 
-def _parse_isin_equities(df: pd.DataFrame, exchange: str) -> pd.DataFrame:
+def is_non_trading_today() -> bool:
+    """
+    用 0050.TW 判斷是否有今日日K。收盤前執行通常無今日K，會判非交易日。
+    """
+    try:
+        tz = pytz.timezone("Asia/Taipei")
+        today_tpe = datetime.now(tz).date()
+        m = download_ohlcv_batches(
+            tickers=["0050.TW"],
+            period="1mo",
+            interval="1d",
+            batch_size=1,
+            retries=1,
+            sleep_sec=0.5
+        )
+        df = m.get("0050.TW")
+        if df is None or df.empty:
+            return True
+        last_date = pd.to_datetime(df.index[-1]).date()
+        return last_date != today_tpe
+    except Exception as e:
+        logger.warning(f"Trading-day check failed: {e}")
+        return False  # 檢查失敗時當交易日處理，避免誤判
+
+
+def build_universe(params: Dict) -> pd.DataFrame:
+    """
+    回傳：code, name, exchange, yahoo
+    exchange: 'TWSE' or 'TPEX'；yahoo: .TW / .TWO
+    """
+    df = fetch_twse_listed_equities()  # 需回傳 exchange 欄位（TWSE/TPEX）
     df = df.copy()
-    # 一般第一欄是「有價證券代號及名稱」
-    name_col = None
-    for c in df.columns:
-        if "有價證券代號及名稱" in str(c):
-            name_col = c
-            break
-    if name_col is None:
-        raise RuntimeError("ISIN 表格結構可能變動，找不到『有價證券代號及名稱』欄。")
 
-    # 去掉表內「產業別」等小節
-    df = df[~df[name_col].astype(str).str.contains("產業別|有價證券代號及名稱", na=False)]
-    # 只保留「XXXX 名稱」格式
-    parts = df[name_col].astype(str).str.split(r"\s+", n=1, regex=True)
-    code = parts.str[0]
-    name = parts.str[1].fillna("")
-    # 過濾非四位數或全數字編碼
-    code = code.str.extract(r"^(\d{4})$")[0]
-    mask = code.notna() & ~name.str.contains(EXCLUDE_KEYWORDS, na=False)
-    out = pd.DataFrame({
-        "code": code[mask].str.zfill(4),
-        "name": name[mask].str.strip()
-    })
-    out["exchange"] = exchange
-    out = out.dropna(subset=["code"]).drop_duplicates(subset=["code"])
-    return out.reset_index(drop=True)
+    def to_yahoo(row):
+        code = str(row["code"]).zfill(4)
+        ex = str(row.get("exchange", "")).upper()
+        if ex in ("TPEX", "OTC", "TWO"):
+            return f"{code}.TWO"
+        return f"{code}.TW"
 
-def fetch_twse_tpex_equities(include_tpex: bool = True) -> pd.DataFrame:
-    # TWSE
-    urls_try = [
-        "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2",  # TWSE
-    ]
-    twse_ok = None
-    for u in urls_try:
-        try:
-            raw = _fetch_isin_table(u)
-            twse_ok = _parse_isin_equities(raw, "TWSE")
-            break
-        except Exception as e:
-            logger.warning("TWSE 取數失敗: %s", e)
-    if twse_ok is None:
-        raise RuntimeError("TWSE ISIN 取得失敗。")
-
-    if not include_tpex:
-        return twse_ok
-
-    # TPEX（上櫃）
-    tpex_ok = None
-    urls_try_tpex = [
-        "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4",
-        "https://isin.tpex.org.tw/isin/C_public.jsp?strMode=4",
-    ]
-    for u in urls_try_tpex:
-        try:
-            raw = _fetch_isin_table(u)
-            tpex_ok = _parse_isin_equities(raw, "TPEX")
-            break
-        except Exception as e:
-            logger.warning("TPEX 取數失敗嘗試 %s: %s", u, e)
-
-    if tpex_ok is None:
-        logger.warning("無法取得上櫃清單，僅使用上市。")
-        return twse_ok
-
-    return pd.concat([twse_ok, tpex_ok], ignore_index=True)
+    df["yahoo"] = df.apply(to_yahoo, axis=1)
+    return df[["code", "name", "exchange", "yahoo"]]
 
 
-# ----------------- 資料下載 -----------------
-def to_yahoo_symbol(code: str, exchange: str) -> str:
-    # TWSE / TPEX 同用 .TW/.TWO
-    suffix = ".TW" if exchange == "TWSE" else ".TWO"
-    return f"{str(code).zfill(4)}{suffix}"
+def golden_cross_recent(K: pd.Series,
+                        D: pd.Series,
+                        window: int,
+                        require_zone: bool,
+                        zone_low: float,
+                        zone_high: float) -> Optional[int]:
+    """
+    近 window 日內，存在某日 (K_prev <= D_prev) 且 (K_curr > D_curr)，
+    目前 K > D；若 require_zone=True，交叉日 K/D 要落在區間內。
+    回傳交叉日索引（相對 series），否則 None。
+    """
+    n = len(K)
+    if n < 2:
+        return None
+    start = max(1, n - window)
+    last_k, last_d = K.iloc[-1], D.iloc[-1]
+    if not (pd.notna(last_k) and pd.notna(last_d) and (last_k > last_d)):
+        return None
 
-def download_ohlcv_batches(tickers: List[str],
-                           period: str = "8mo",
-                           interval: str = "1d",
-                           batch_size: int = 120,
-                           sleep_sec: float = 0.8) -> Dict[str, pd.DataFrame]:
-    data_map: Dict[str, pd.DataFrame] = {}
-    for i in range(0, len(tickers), batch_size):
-        batch = tickers[i:i + batch_size]
-        try:
-            df = yf.download(
-                tickers=batch, period=period, interval=interval,
-                group_by="ticker", auto_adjust=False, threads=True, progress=False
-            )
-            if isinstance(df.columns, pd.MultiIndex):
-                for t in batch:
-                    if t in df.columns.levels[0]:
-                        sub = df[t].dropna(how="all")
-                        if not sub.empty:
-                            sub = sub.rename(columns=str.title)  # Open/High/Low/Close/Adj Close/Volume
-                            data_map[t] = sub
-            else:
-                # 單一股票情境
-                sub = df.dropna(how="all")
-                if not sub.empty:
-                    sub = sub.rename(columns=str.title)
-                    data_map[batch[0]] = sub
-        except Exception as e:
-            logger.warning("下載價格失敗 batch %d-%d: %s", i, i + len(batch), e)
-        time.sleep(sleep_sec)
-    return data_map
-
-
-# ----------------- 技術指標 -----------------
-def sma(x: pd.Series, n: int) -> pd.Series:
-    return x.rolling(n, min_periods=n).mean()
-
-def stochastic_kd(high: pd.Series, low: pd.Series, close: pd.Series,
-                  n: int = 9, k_smooth: int = 3, d_period: int = 3) -> Tuple[pd.Series, pd.Series]:
-    ll = low.rolling(n, min_periods=n).min()
-    hh = high.rolling(n, min_periods=n).max()
-    rsv = (close - ll) / (hh - ll) * 100.0
-    K = rsv.rolling(k_smooth, min_periods=k_smooth).mean()
-    D = K.rolling(d_period, min_periods=d_period).mean()
-    return K, D
-
-def find_golden_cross_in_window(K: pd.Series, D: pd.Series,
-                                window: int,
-                                zone_low: float, zone_high: float,
-                                require_zone: bool) -> Optional[int]:
-    # 回傳 cross 的整數位置（iloc索引），若無則 None
-    last = len(K) - 1
-    start = max(1, last - window + 1)
-    for i in range(start, last + 1):
-        try:
-            prev_k, prev_d = K.iloc[i - 1], D.iloc[i - 1]
-            cur_k, cur_d  = K.iloc[i], D.iloc[i]
-        except Exception:
+    for i in range(start, n):
+        k_prev, d_prev = K.iloc[i-1], D.iloc[i-1]
+        k_curr, d_curr = K.iloc[i], D.iloc[i]
+        if np.isnan([k_prev, d_prev, k_curr, d_curr]).any():
             continue
-        if np.isnan(prev_k) or np.isnan(prev_d) or np.isnan(cur_k) or np.isnan(cur_d):
-            continue
-        crossed = (prev_k <= prev_d) and (cur_k > cur_d)
+        crossed = (k_prev <= d_prev) and (k_curr > d_curr)
         if not crossed:
             continue
         if require_zone:
-            if not (zone_low <= cur_k <= zone_high and zone_low <= cur_d <= zone_high):
+            if not (zone_low <= k_curr <= zone_high and zone_low <= d_curr <= zone_high):
                 continue
         return i
     return None
 
 
-# ----------------- 市值（yfinance fast_info） -----------------
-def get_market_caps_yf(tickers: List[str], sleep: float = 0.05) -> Dict[str, Optional[float]]:
-    out: Dict[str, Optional[float]] = {}
-    for t in tickers:
-        mc = None
+def volume_today_over_ma(volume: pd.Series, lookback: int, multiplier: float):
+    """今日量 / 過去 lookback 日均量（不含今日） >= multiplier"""
+    if len(volume) < lookback + 1:
+        return False, np.nan, np.nan, np.nan
+    v_today = float(volume.iloc[-1])
+    v_ref = float(pd.Series(volume.iloc[-(lookback+1):-1]).mean())
+    if not (math.isfinite(v_today) and math.isfinite(v_ref)) or v_ref <= 0:
+        return False, np.nan, v_today, v_ref
+    ratio = v_today / v_ref
+    return (ratio >= multiplier), ratio, v_today, v_ref
+
+
+def liquidity_10d_ok(volume: pd.Series, min_share: int) -> bool:
+    """最近10日每日成交量皆 >= min_share"""
+    if len(volume) < 10:
+        return False
+    last10 = volume.iloc[-10:]
+    return bool((last10 >= min_share).all())
+
+
+def compute_streak_days(code: str, today: datetime.date, lookback_days: int = 14) -> int:
+    """
+    計算「連續出現天數」：含今天。
+    逐日回看 picks_YYYYMMDD.csv，直到缺檔或未出現即中斷。
+    """
+from datetime import datetime, timedelta
+
+def _find_pick_file_by_date(dte: datetime.date) -> Optional[Path]:
+    fname = f"picks_{dte.strftime('%Y%m%d')}.csv"
+    # 先找 output，再找 history
+    for base in (OUTPUT_DIR, HISTORY_DIR):
+        p = base / fname
+        if p.exists():
+            return p
+    return None
+
+def compute_streak_days(code: str, today: datetime.date, lookback_days: int = 14) -> int:
+    streak = 1
+    for d in range(1, lookback_days + 1):
+        dte = (datetime.combine(today, datetime.min.time()) - timedelta(days=d)).date()
+        p = _find_pick_file_by_date(dte)
+        if p is None:
+            break
         try:
-            tk = yf.Ticker(t)
-            # 優先 fast_info
-            fi = getattr(tk, "fast_info", None)
-            if fi and "market_cap" in fi and fi["market_cap"]:
-                mc = float(fi["market_cap"])
-            else:
-                info = tk.info or {}
-                mc = float(info.get("marketCap") or 0) or None
+            df_prev = pd.read_csv(p, dtype={"code": str})
+            if not (df_prev["code"].astype(str) == str(code)).any():
+                break
+            streak += 1
         except Exception:
-            mc = None
-        out[t] = mc
-        time.sleep(sleep)
-    return out
+            break
+    return streak
 
 
-# ----------------- 持久化連續天數 -----------------
-STREAKS_PATH = STATE_DIR / "streaks.json"
-
-def load_streaks() -> Dict[str, Dict[str, int]]:
-    if STREAKS_PATH.exists():
-        try:
-            return json.loads(STREAKS_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
-
-def save_streaks(updated: Dict[str, Dict[str, int]]) -> None:
-    STREAKS_PATH.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-# ----------------- Telegram -----------------
-def send_telegram_message(bot_token: str, chat_id: str, text: str) -> None:
-    if not bot_token or not chat_id:
-        logger.info("Telegram not configured; skip Telegram sending.")
-        return
-    try:
-        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        resp = requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=30)
-        if resp.status_code != 200:
-            logger.warning("Telegram send failed: %s %s", resp.status_code, resp.text)
-    except Exception as e:
-        logger.warning("Telegram send error: %s", e)
-
-
-# ----------------- 單檔評估 -----------------
-def evaluate_one(df: pd.DataFrame, params: dict) -> Optional[dict]:
-    if df is None or df.empty:
-        return None
-    if df["Volume"].fillna(0).sum() == 0:
+# ----------------- 個股海選（不含市值） -----------------
+def evaluate_signals_for_ticker(df: pd.DataFrame, params: Dict) -> Optional[Dict]:
+    if df is None or df.empty or {"Open","High","Low","Close","Volume"} - set(df.columns):
         return None
 
-    # 至少要有 40 根才算較穩（MA20、KD等）
-    if len(df) < max(40, params["KD_N"] + params["KD_K_SMOOTH"] + params["KD_D_PERIOD"] + 5):
+    min_len = max(
+        params["VOLUME_LOOKBACK"] + 1,
+        params["KD_N"] + params["KD_K_SMOOTH"] + params["KD_D_PERIOD"] + 5,
+        30
+    )
+    if len(df) < min_len:
         return None
 
-    close = df["Close"]
-    high  = df["High"]
-    low   = df["Low"]
-    open_ = df["Open"]
-    vol   = df["Volume"]
+    o = df["Open"].astype(float)
+    h = df["High"].astype(float)
+    l = df["Low"].astype(float)
+    c = df["Close"].astype(float)
+    v = df["Volume"].fillna(0).astype(float)
+    if v.sum() == 0:
+        return None
 
-    ma5  = sma(close, 5)
-    ma10 = sma(close, 10)
-    ma20 = sma(close, 20)
+    ma5 = c.rolling(5).mean()
+    ma10 = c.rolling(10).mean()
+    ma20 = c.rolling(20).mean()
 
-    K, D = stochastic_kd(high, low, close,
+    K, D = stochastic_kd(h, l, c,
                          n=params["KD_N"],
                          k_smooth=params["KD_K_SMOOTH"],
                          d_period=params["KD_D_PERIOD"])
+    if K is None or D is None or len(K) != len(c):
+        return None
 
-    last = -1
-    # —— B 結構 —— #
-    if params["ENABLE_RULE_MA5_GT_MA20"]:
-        if np.isnan(ma5.iloc[last]) or np.isnan(ma20.iloc[last]) or (ma5.iloc[last] <= ma20.iloc[last]):
-            return None
-
-    if params["ENABLE_RULE_OC_ABOVE_MA20"]:
-        if np.isnan(ma20.iloc[last]) or (open_.iloc[last] < ma20.iloc[last] and close.iloc[last] < ma20.iloc[last]):
-            return None
-
-    if params["ENABLE_RULE_LAST5_MA10_THRESHOLD"]:
-        last5 = close.iloc[-5:]
-        below = (last5 < ma10.iloc[-5:]).sum()
-        if below > params["MAX_DAYS_BELOW_MA10_IN_5"]:
-            return None
-
-    # —— C KD —— #
-    cross_idx = find_golden_cross_in_window(
+    # KD 黃金交叉（近 N 日）且目前 K > D（必要）
+    cross_idx = golden_cross_recent(
         K, D,
         window=params["KD_CROSS_WINDOW"],
-        zone_low=params["KD_ZONE_LOW"], zone_high=params["KD_ZONE_HIGH"],
-        require_zone=params["KD_REQUIRE_ZONE"]
+        require_zone=params["KD_REQUIRE_ZONE"],
+        zone_low=params["KD_ZONE_LOW"],
+        zone_high=params["KD_ZONE_HIGH"]
     )
     if cross_idx is None:
         return None
-    # 交叉後當下要 K > D
-    if np.isnan(K.iloc[last]) or np.isnan(D.iloc[last]) or (K.iloc[last] <= D.iloc[last]):
+
+    # 放量：今日量 >= 20MA量 * 倍數
+    vol_ok, vol_ratio, v_today, v20_avg = volume_today_over_ma(
+        v, params["VOLUME_LOOKBACK"], params["VOLUME_MULTIPLIER"]
+    )
+    if not vol_ok:
         return None
 
-    # —— D 量價 —— #
-    # 當日成交量 / 過去20日均量（不含當日）
-    if len(vol) < params["VOLUME_LOOKBACK"] + 1:
-        return None
-    v20 = vol.iloc[-(params["VOLUME_LOOKBACK"] + 1):-1].mean()
-    if v20 <= 0:
-        return None
-    vol_ratio = float(vol.iloc[last] / v20)
-    if vol_ratio < params["VOLUME_MULTIPLIER"]:
+    # 10日流動性：最近10日每日成交量皆 >= 100萬股
+    if not liquidity_10d_ok(v, params["MIN_DAILY_VOLUME_10D"]):
         return None
 
-    # 黑K 限制：若收黑，收盤 >= 開盤 * 0.95
+    # 多頭排列：MA5 > MA20
+    if params["ENABLE_RULE_MA5_GT_MA20"]:
+        if not (ma5.iloc[-1] > ma20.iloc[-1]):
+            return None
+
+    # MA20 保護：當日 O 或 C >= MA20
+    if params["ENABLE_RULE_OC_ABOVE_MA20"]:
+        if not ( (o.iloc[-1] >= ma20.iloc[-1]) or (c.iloc[-1] >= ma20.iloc[-1]) ):
+            return None
+
+    # MA10 穩健度：近5日，收盤 < MA10 的天數 <= 門檻
+    if params["ENABLE_RULE_LAST5_MA10_THRESHOLD"]:
+        last5 = c.iloc[-5:]
+        last5_ma10 = ma10.iloc[-5:]
+        if last5_ma10.isna().any():
+            return None
+        days_below = int((last5 < last5_ma10).sum())
+        if days_below > params["MAX_DAYS_BELOW_MA10_IN_5"]:
+            return None
+
+    # 黑K 限制：若 C < O，則 C >= O * 0.95
     if params["ENABLE_RULE_BLACK_CANDLE_LIMIT"]:
-        if close.iloc[last] < open_.iloc[last]:
-            if close.iloc[last] < open_.iloc[last] * params["BLACK_CANDLE_MAX_DROP"]:
+        if c.iloc[-1] < o.iloc[-1]:
+            if c.iloc[-1] < (o.iloc[-1] * params["BLACK_CANDLE_MAX_DROP"]):
                 return None
 
-    # —— E 流動性：近10日每日量 >= 門檻 —— #
-    last10 = vol.iloc[-10:]
-    if (last10 < params["LIQ_MIN_VOL_LAST10"]).any():
-        return None
-
-    # 輸出
-    out = dict(
-        date=pd.to_datetime(df.index[last]).date().isoformat(),
-        close=float(close.iloc[last]),
-        K=float(K.iloc[last]) if not np.isnan(K.iloc[last]) else None,
-        D=float(D.iloc[last]) if not np.isnan(D.iloc[last]) else None,
-        kd_spread=float(K.iloc[last] - D.iloc[last]) if (not np.isnan(K.iloc[last]) and not np.isnan(D.iloc[last])) else None,
+    return dict(
+        date=pd.to_datetime(df.index[-1]).date().isoformat(),
+        close=float(c.iloc[-1]),
+        K=float(K.iloc[-1]) if pd.notna(K.iloc[-1]) else np.nan,
+        D=float(D.iloc[-1]) if pd.notna(D.iloc[-1]) else np.nan,
+        k_d_spread=float(K.iloc[-1] - D.iloc[-1]) if pd.notna(K.iloc[-1]) and pd.notna(D.iloc[-1]) else np.nan,
         vol_ratio=float(vol_ratio),
-        price_ma20_pct=float((close.iloc[last] - ma20.iloc[last]) / ma20.iloc[last]) if not np.isnan(ma20.iloc[last]) and ma20.iloc[last] != 0 else None,
+        ma20=float(ma20.iloc[-1]),
+        trend_strength=float((c.iloc[-1] - ma20.iloc[-1]) / ma20.iloc[-1]) if ma20.iloc[-1] and not np.isnan(ma20.iloc[-1]) else np.nan,
+        cross_day=pd.to_datetime(df.index[cross_idx]).date().isoformat()
     )
-    return out
+
+
+def format_summary_line(code: str, name: str, r: pd.Series, with_streak_icon: bool = True) -> str:
+    """摘要：收盤、KD、放量倍數；可選擇是否顯示🔥連N"""
+    kd_part = f"K {r['K']:.2f} / D {r['D']:.2f}" if pd.notna(r["K"]) and pd.notna(r["D"]) else "KD N/A"
+    vol_part = f"{r['vol_ratio']:.2f}x" if pd.notna(r["vol_ratio"]) else "N/A"
+    price_part = f"{r['close']:.2f}"
+    streak_tag = ""
+    if with_streak_icon and (("streak_days" in r) and pd.notna(r["streak_days"]) and int(r["streak_days"]) >= 2):
+        streak_tag = f" 🔥連{int(r['streak_days'])}"
+    return f"{code} {name}{streak_tag} | 收盤 {price_part} | {kd_part} | 放量 {vol_part}"
 
 
 # ----------------- 主流程 -----------------
 def run_once():
     params = get_env_params()
 
-    # 1) 建立股票池
-    logger.info("Building universe from TWSE/TPEX ISIN page...")
-    uni = fetch_twse_tpex_equities(include_tpex=params["INCLUDE_TPEX"])
-    uni["yahoo"] = uni.apply(lambda r: to_yahoo_symbol(r["code"], r["exchange"]), axis=1)
-    logger.info("Universe size: %d", len(uni))
-
-    # 2) 抓價量
-    logger.info("Downloading OHLCV from Yahoo in batches...")
-    tickers = uni["yahoo"].tolist()
-    data_map = download_ohlcv_batches(tickers, period="8mo", interval="1d", batch_size=params["BATCH_SIZE"])
-
-    # 3) 以全市場資料推算「最新/前一」交易日，並判斷是否非交易日
-       # 3) 以全市場資料推算「最新/前一」交易日（用最新可得日K繼續跑）
-    latest_dates = []
-    prev_dates = []
-    for df in data_map.values():
-        if df is None or df.empty:
-            continue
-        idx = pd.to_datetime(df.index)
-        latest_dates.append(idx[-1].date())
-        if len(idx) >= 2:
-            prev_dates.append(idx[-2].date())
-
-    if not latest_dates:
-        # 真的什麼都抓不到才輸出空檔
-        tz = ZoneInfo("Asia/Taipei") if ZoneInfo else None
-        today_tpe = datetime.now(tz).date() if tz else datetime.utcnow().date()
-        out_empty = OUTPUT_DIR / f"picks_{today_tpe.strftime('%Y%m%d')}.csv"
-        pd.DataFrame(columns=[
-            "date","code","name","exchange","yahoo","close","K","D","vol_ratio",
-            "kd_spread","price_ma20_pct","score","continuation_days"
-        ]).to_csv(out_empty, index=False, encoding="utf-8-sig")
-        send_telegram_message(params["TELEGRAM_BOT_TOKEN"], params["TELEGRAM_CHAT_ID"],
-                              "今日抓不到任何最新日K（資料源延遲或網路問題），已輸出空表。")
-        logger.info("No bars at all. Wrote empty CSV: %s", out_empty)
+    # 非交易日
+    if is_non_trading_today():
+        msg = "今日為非交易日，請開心過好每一天"
+        bot, chat = params.get("TELEGRAM_BOT_TOKEN"), params.get("TELEGRAM_CHAT_ID")
+        if bot and chat:
+            try:
+                send_telegram_message(bot, chat, msg)
+                logger.info("Sent non-trading-day notice via Telegram.")
+            except Exception as e:
+                logger.warning(f"Telegram notice failed: {e}")
+        else:
+            logger.info("Telegram not configured; skip non-trading-day notice.")
         return
 
-    latest_trade_date = max(latest_dates)  # 用「最新可得」那天繼續流程
-    prev_trade_date = max([d for d in prev_dates if d < latest_trade_date], default=latest_trade_date)
+    # 建立市場清單
+    logger.info("Building universe from TWSE/TPEX ISIN page...")
+    uni = build_universe(params)
+    logger.info(f"Universe size: {len(uni)}")
 
+    # 下載 OHLCV
+    tickers = uni["yahoo"].tolist()
+    code_map = dict(zip(uni["yahoo"], uni["code"]))
+    name_map = dict(zip(uni["yahoo"], uni["name"]))
 
-    # 4) 先做技術面與量能等條件，減少後續市值查詢量
-    rows_pre: List[dict] = []
-    for _, r in uni.iterrows():
-        ysym = r["yahoo"]
-        df = data_map.get(ysym)
+    logger.info("Downloading OHLCV from Yahoo in batches...")
+    data_map = download_ohlcv_batches(
+        tickers,
+        period="6mo",
+        interval="1d",
+        batch_size=params["BATCH_SIZE"],
+        retries=2,
+        sleep_sec=1.0
+    )
+
+    # 海選（不含市值）
+    prelim_rows = []
+    for ysym, df in data_map.items():
         try:
-            sig = evaluate_one(df, params)
+            sig = evaluate_signals_for_ticker(df, params)
             if sig:
-                rows_pre.append({
-                    "date": sig["date"],
-                    "code": r["code"],
-                    "name": r["name"],
-                    "exchange": r["exchange"],
-                    "yahoo": ysym,
-                    "close": sig["close"],
-                    "K": sig["K"],
-                    "D": sig["D"],
-                    "kd_spread": sig["kd_spread"],
-                    "vol_ratio": sig["vol_ratio"],
-                    "price_ma20_pct": sig["price_ma20_pct"],
+                prelim_rows.append({
+                    "ysym": ysym,
+                    "code": str(code_map.get(ysym, "")),
+                    "name": name_map.get(ysym, ""),
+                    **sig
                 })
         except Exception as e:
-            logger.warning("Signal evaluation failed for %s: %s", ysym, e)
+            logger.warning(f"Signal evaluation failed for {ysym}: {e}")
 
-    if not rows_pre:
-        # 沒有任何通過技術面者，直接輸出空表
-        today = latest_trade_date.strftime("%Y%m%d")
+    today = today_str_tpe()
+
+    if not prelim_rows:
+        logger.info("No candidates after pre-screen. Saving empty CSV and notifying...")
         out_path = OUTPUT_DIR / f"picks_{today}.csv"
-        pd.DataFrame(columns=[
-            "date","code","name","exchange","yahoo","close","K","D",
-            "vol_ratio","kd_spread","price_ma20_pct","score","continuation_days"
-        ]).to_csv(out_path, index=False, encoding="utf-8-sig")
-        send_telegram_message(params["TELEGRAM_BOT_TOKEN"], params["TELEGRAM_CHAT_ID"],
-                              f"今日無任何標的通過技術面條件。")
-        logger.info("No technical candidates. Saved empty: %s", out_path)
+        pd.DataFrame(columns=["date","code","name","close","K","D","vol_ratio","cross_day","market_cap",
+                              "k_d_spread","trend_strength","rank_k","rank_v","a","b","score","streak_days"]
+                     ).to_csv(out_path, index=False, encoding="utf-8-sig")
+        bot, chat = params.get("TELEGRAM_BOT_TOKEN"), params.get("TELEGRAM_CHAT_ID")
+        if bot and chat:
+            try:
+                send_telegram_message(bot, chat, f"[KD Screener] {today} 今日無符合條件之個股。")
+            except Exception as e:
+                logger.warning(f"Telegram send failed: {e}")
         return
 
-    # 5) 只對技術面通過者查市值，再套市值門檻
-    cands_df = pd.DataFrame(rows_pre)
-    logger.info("Fetching market caps from Yahoo for %d candidates...", len(cands_df))
-    mcs = get_market_caps_yf(cands_df["yahoo"].tolist())
-    cands_df["market_cap"] = cands_df["yahoo"].map(mcs)
-    cands_df = cands_df[(~cands_df["market_cap"].isna()) & (cands_df["market_cap"] >= params["MARKET_CAP_MIN"])]
+    df_cand = pd.DataFrame(prelim_rows)
 
-    if cands_df.empty:
-        today = latest_trade_date.strftime("%Y%m%d")
+    # 市值過濾
+    cand_syms = df_cand["ysym"].dropna().unique().tolist()
+    logger.info(f"Fetching market caps from Yahoo for {len(cand_syms)} candidates...")
+    mc_map = get_market_caps(cand_syms, retries=1, sleep=0.05)
+    df_cand["market_cap"] = df_cand["ysym"].map(mc_map).astype(float)
+    df_cand = df_cand[df_cand["market_cap"] >= params["MARKET_CAP_MIN"]].copy()
+
+    if df_cand.empty:
+        logger.info("No candidates after market cap filter. Saving empty CSV and notifying...")
         out_path = OUTPUT_DIR / f"picks_{today}.csv"
-        cands_df.to_csv(out_path, index=False, encoding="utf-8-sig")
-        send_telegram_message(params["TELEGRAM_BOT_TOKEN"], params["TELEGRAM_CHAT_ID"],
-                              f"技術面通過，但無符合市值門檻（≥{int(params['MARKET_CAP_MIN'])}）。")
-        logger.info("No candidates after market-cap filter. Saved: %s", out_path)
+        pd.DataFrame(columns=["date","code","name","close","K","D","vol_ratio","cross_day","market_cap",
+                              "k_d_spread","trend_strength","rank_k","rank_v","a","b","score","streak_days"]
+                     ).to_csv(out_path, index=False, encoding="utf-8-sig")
+        bot, chat = params.get("TELEGRAM_BOT_TOKEN"), params.get("TELEGRAM_CHAT_ID")
+        if bot and chat:
+            try:
+                send_telegram_message(bot, chat, f"[KD Screener] {today} 今日無符合條件之個股。")
+            except Exception as e:
+                logger.warning(f"Telegram send failed: {e}")
         return
 
-    # 6) 排序分數（a,b,c）與 score
-    #   a = (2 - 0.02 * n_k) ；n_k 為 (K-D) 由大->小名次
-    #   b = (2 - 0.02 * n_v) ；n_v 為 vol_ratio 由大->小名次
-    #   c = price_ma20_pct  原始值
-    cands_df = cands_df.copy()
-    cands_df["rk_kd"] = cands_df["kd_spread"].rank(ascending=False, method="min").astype(int)
-    cands_df["rk_vol"] = cands_df["vol_ratio"].rank(ascending=False, method="min").astype(int)
-    cands_df["a"] = 2.0 - 0.02 * cands_df["rk_kd"]
-    cands_df["b"] = 2.0 - 0.02 * cands_df["rk_vol"]
-    cands_df["c"] = cands_df["price_ma20_pct"].fillna(0.0)
-    cands_df["score"] = cands_df["a"] * cands_df["b"] * cands_df["c"]
+    # 排名因子與分數
+    df_cand["rank_k"] = df_cand["k_d_spread"].rank(method="first", ascending=False)
+    df_cand["rank_v"] = df_cand["vol_ratio"].rank(method="first", ascending=False)
+    df_cand["a"] = 2 - 0.02 * df_cand["rank_k"]
+    df_cand["b"] = 2 - 0.02 * df_cand["rank_v"]
+    df_cand["score"] = df_cand["a"] * df_cand["b"] * df_cand["trend_strength"]
+    df_cand.sort_values(["score", "vol_ratio", "k_d_spread"], ascending=False, inplace=True)
 
-    cands_df = cands_df.sort_values(["score", "vol_ratio", "kd_spread"], ascending=[False, False, False])
+    # 連續出現標記
+    tz = pytz.timezone("Asia/Taipei")
+    today_date = datetime.now(tz).date()
+    df_cand["streak_days"] = df_cand["code"].apply(lambda x: compute_streak_days(str(x), today_date))
 
-    # 7) 連續出現：依 prev_trade_date 判斷是否延續
-    key_field = params.get("CONTINUATION_KEY", "yahoo")
-    if key_field not in cands_df.columns:
-        key_field = "yahoo"
+    # 只留 TOP_N
+    topn = max(1, int(params["TOP_N"]))
+    df_out = df_cand.head(topn).copy()
 
-    streaks = load_streaks()
-    updated: Dict[str, Dict[str, int]] = {}
-    cont_days = []
-    for _, row in cands_df.iterrows():
-        key = str(row[key_field])
-        prev = streaks.get(key)
-        if prev and prev.get("last_date") == str(prev_trade_date):
-            days = int(prev.get("streak", 1)) + 1
-        else:
-            days = 1
-        cont_days.append(days)
-        updated[key] = {"last_date": str(latest_trade_date), "streak": days}
-    cands_df["continuation_days"] = cont_days
-
-    save_streaks(updated)
-
-    # 8) 取前 TOP_N
-    topN = max(1, int(params["TOP_N"]))
-    df_top = cands_df.head(topN).reset_index(drop=True)
-
-    # 9) 存檔 CSV
-    today = latest_trade_date.strftime("%Y%m%d")
+    # 存檔（單一 CSV 保留）
     out_path = OUTPUT_DIR / f"picks_{today}.csv"
-    df_top.to_csv(out_path, index=False, encoding="utf-8-sig")
-    logger.info("Saved results to %s (count=%d)", out_path, len(df_top))
+    cols = ["date","code","name","close","K","D","vol_ratio","cross_day","market_cap",
+            "k_d_spread","trend_strength","rank_k","rank_v","a","b","score","streak_days"]
+    df_out.to_csv(out_path, index=False, encoding="utf-8-sig")
+    logger.info(f"Saved results to {out_path} (count={len(df_out)})")
 
-    # 10) Telegram 訊息：分兩表
-    cont_df = df_top[df_top["continuation_days"] >= 2].copy()
-    one_df = df_top[df_top["continuation_days"] < 2].copy()
+    # ===== Telegram：分成兩個表區塊 =====
+    bot, chat = params.get("TELEGRAM_BOT_TOKEN"), params.get("TELEGRAM_CHAT_ID")
+    if bot and chat:
+        try:
+            if df_out.empty:
+                text = f"[KD Screener] {today} 今日無符合條件之個股。"
+            else:
+                header = f"[TWSE/TPEX KD Screener] {today} 前{len(df_out)}名（依 score）"
+                df_hot = df_out[df_out["streak_days"] >= 2].copy()
+                df_new = df_out[df_out["streak_days"] < 2].copy()
 
-    def fmt_row(r) -> str:
-        # 只顯示：收盤、KD、放量倍數；(連N) 只在連續表顯示
-        return f"{r['code']} {r['name']} | 收 {r['close']:.2f} | K {r['K']:.2f} / D {r['D']:.2f} | 倍數 {r['vol_ratio']:.2f}"
+                lines = [header]
 
-    lines = [f"TWSE/TPEX KD 選股結果（Top {len(df_top)}）"]
-    lines.append(f"連續≥2天：{len(cont_df)} 檔； 單日：{len(one_df)} 檔")
-    lines.append("")
+                # 表一：連續出現（>=2日）
+                if not df_hot.empty:
+                    lines.append("")
+                    lines.append("🔥 連續出現（≥2日）")
+                    for _, r in df_hot.iterrows():
+                        lines.append(" - " + format_summary_line(str(r["code"]), str(r["name"]), r, with_streak_icon=True))
+                else:
+                    lines.append("")
+                    lines.append("🔥 連續出現（≥2日）：無")
 
-    if not cont_df.empty:
-        lines.append("▶ 連續出現（顯示連續天數）：")
-        for _, r in cont_df.iterrows():
-            lines.append(f"{fmt_row(r)} | (連{int(r['continuation_days'])})")
-        lines.append("")
+                # 表二：非連續（今日首次或中斷）
+                if not df_new.empty:
+                    lines.append("")
+                    lines.append("— 非連續（今日首次或中斷） —")
+                    for _, r in df_new.iterrows():
+                        # 非連續段不顯示🔥標籤
+                        lines.append(" - " + format_summary_line(str(r["code"]), str(r["name"]), r, with_streak_icon=False))
+                else:
+                    lines.append("")
+                    lines.append("— 非連續（今日首次或中斷） — 無")
 
-    lines.append("▶ 非連續標的：")
-    if one_df.empty:
-        lines.append("(無)")
+                text = "\n".join(lines)
+
+            send_telegram_message(bot, chat, text)
+            logger.info("Telegram sent.")
+        except Exception as e:
+            logger.warning(f"Telegram send failed: {e}")
     else:
-        for _, r in one_df.iterrows():
-            lines.append(fmt_row(r))
-
-    send_telegram_message(params["TELEGRAM_BOT_TOKEN"], params["TELEGRAM_CHAT_ID"], "\n".join(lines))
+        logger.info("Telegram not configured; skip Telegram sending.")
 
 
 if __name__ == "__main__":
     try:
         run_once()
     except Exception as e:
-        logger.error("Fatal error: %s\n%s", e, traceback.format_exc())
-        # 如果炸了也讓你在 TG 收到
+        logger.error(f"Fatal error: {e}\n{traceback.format_exc()}")
         try:
-            p = get_env_params()
-            send_telegram_message(p["TELEGRAM_BOT_TOKEN"], p["TELEGRAM_CHAT_ID"], f"❌ Screener 發生錯誤：\n{e}")
+            load_dotenv(ROOT / ".env", override=True)
+            bot = os.getenv("TELEGRAM_BOT_TOKEN")
+            chat = os.getenv("TELEGRAM_CHAT_ID")
+            if bot and chat:
+                send_telegram_message(bot, chat, f"❌ Screener 例外：{e}")
         except Exception:
             pass
+        sys.exit(1)
