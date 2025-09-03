@@ -419,6 +419,7 @@ def run_once():
     data_map = download_ohlcv_batches(tickers, period="8mo", interval="1d", batch_size=params["BATCH_SIZE"])
 
     # 3) 以全市場資料推算「最新/前一」交易日，並判斷是否非交易日
+       # 3) 以全市場資料推算「最新/前一」交易日（用最新可得日K繼續跑）
     latest_dates = []
     prev_dates = []
     for df in data_map.values():
@@ -429,29 +430,23 @@ def run_once():
         if len(idx) >= 2:
             prev_dates.append(idx[-2].date())
 
-    latest_trade_date = max(latest_dates) if latest_dates else None
-    tz = ZoneInfo("Asia/Taipei") if ZoneInfo else None
-    today_tpe = datetime.now(tz).date() if tz else datetime.utcnow().date()
-
-    if (latest_trade_date is None) or (latest_trade_date < today_tpe):
-        # 非交易日：寫空CSV並發訊
+    if not latest_dates:
+        # 真的什麼都抓不到才輸出空檔
+        tz = ZoneInfo("Asia/Taipei") if ZoneInfo else None
+        today_tpe = datetime.now(tz).date() if tz else datetime.utcnow().date()
         out_empty = OUTPUT_DIR / f"picks_{today_tpe.strftime('%Y%m%d')}.csv"
         pd.DataFrame(columns=[
             "date","code","name","exchange","yahoo","close","K","D","vol_ratio",
             "kd_spread","price_ma20_pct","score","continuation_days"
         ]).to_csv(out_empty, index=False, encoding="utf-8-sig")
         send_telegram_message(params["TELEGRAM_BOT_TOKEN"], params["TELEGRAM_CHAT_ID"],
-                              "今日為非交易日，請開心過好每一天")
-        logger.info("No today bars -> Non-trading day. Wrote empty CSV: %s", out_empty)
+                              "今日抓不到任何最新日K（資料源延遲或網路問題），已輸出空表。")
+        logger.info("No bars at all. Wrote empty CSV: %s", out_empty)
         return
 
-    prev_trade_date = None
-    if prev_dates:
-        prev_candidates = [d for d in prev_dates if d < latest_trade_date]
-        if prev_candidates:
-            prev_trade_date = max(prev_candidates)
-    if prev_trade_date is None:
-        prev_trade_date = latest_trade_date
+    latest_trade_date = max(latest_dates)  # 用「最新可得」那天繼續流程
+    prev_trade_date = max([d for d in prev_dates if d < latest_trade_date], default=latest_trade_date)
+
 
     # 4) 先做技術面與量能等條件，減少後續市值查詢量
     rows_pre: List[dict] = []
