@@ -3,13 +3,12 @@
 
 import os
 import sys
-import time
 import math
 import logging
 import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -36,10 +35,10 @@ except Exception:
             raise RuntimeError(f"Telegram API error: {e}")
 
 # ----------------- 目錄與記錄 -----------------
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[1]  # repo 根目錄（src 的上一層）
 OUTPUT_DIR = ROOT / "output"
 LOG_DIR = ROOT / "logs"
-HISTORY_DIR = ROOT / "history"
+HISTORY_DIR = ROOT / "history"  # 與 src 同層
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 HISTORY_DIR.mkdir(parents=True, exist_ok=True)
@@ -66,11 +65,11 @@ def get_env_params() -> Dict:
         KD_ZONE_LOW=float(os.getenv("KD_ZONE_LOW", "40")),
         KD_ZONE_HIGH=float(os.getenv("KD_ZONE_HIGH", "80")),
 
-        # Volume today vs 20-day avg
+        # 量能相對均量
         VOLUME_LOOKBACK=int(os.getenv("VOLUME_LOOKBACK", "20")),
         VOLUME_MULTIPLIER=float(os.getenv("VOLUME_MULTIPLIER", "1.5")),
 
-        # 10日流動性下限（每日皆 >= 100萬股）
+        # 10日流動性下限（每日皆 >= X 股）
         MIN_DAILY_VOLUME_10D=int(os.getenv("MIN_DAILY_VOLUME_10D", "1000000")),
 
         # 價格/MAs 規則
@@ -81,7 +80,7 @@ def get_env_params() -> Dict:
         MAX_DAYS_BELOW_MA10_IN_5=int(os.getenv("MAX_DAYS_BELOW_MA10_IN_5", "3")),
         ENABLE_RULE_MA5_GT_MA20=os.getenv("ENABLE_RULE_MA5_GT_MA20", "true").lower() == "true",
 
-        # 市值
+        # 市值門檻
         MARKET_CAP_MIN=float(os.getenv("MARKET_CAP_MIN", "10000000000")),  # 100億
 
         # 取資料
@@ -115,7 +114,7 @@ def today_str_tpe() -> str:
 def is_non_trading_today() -> bool:
     """
     用 0050.TW 判斷是否有今日日K。
-    但若台北時間 >= 13:35 且為周一~周五，即使 Yahoo 尚未更新日K，仍視為交易日以避免 13:40 誤判。
+    但若台北時間 >= 13:35 且為週一~週五，即使 Yahoo 尚未更新日K，仍視為交易日（避免 13:40 誤判）。
     """
     try:
         tz = pytz.timezone("Asia/Taipei")
@@ -132,7 +131,6 @@ def is_non_trading_today() -> bool:
         )
         df = m.get("0050.TW")
         if df is None or df.empty:
-            # 若資料取不到，13:35 後的平日視為交易日，其他時間保守視為非交易日
             if now_tpe.weekday() < 5 and (now_tpe.hour * 60 + now_tpe.minute) >= (13 * 60 + 35):
                 return False
             return True
@@ -141,15 +139,13 @@ def is_non_trading_today() -> bool:
         if last_date == today_tpe:
             return False
 
-        # 尚無今日日K，但若已過 13:35 且為平日，當作交易日
         if now_tpe.weekday() < 5 and (now_tpe.hour * 60 + now_tpe.minute) >= (13 * 60 + 35):
             return False
 
         return True
     except Exception as e:
         logger.warning(f"Trading-day check failed: {e}")
-        # 檢查失敗時，以交易日處理（不阻擋流程）
-        return False
+        return False  # 檢查失敗時以交易日處理
 
 
 def build_universe(params: Dict) -> pd.DataFrame:
@@ -179,7 +175,7 @@ def golden_cross_recent(K: pd.Series,
                         zone_high: float) -> Optional[int]:
     """
     近 window 日內，存在某日 (K_prev <= D_prev) 且 (K_curr > D_curr)，
-    目前 K > D；若 require_zone=True，交叉日 K/D 要落在區間內。
+    且目前 K > D；若 require_zone=True，交叉日 K/D 要落在區間內。
     回傳交叉日索引（相對 series），否則 None。
     """
     n = len(K)
@@ -313,7 +309,7 @@ def evaluate_signals_for_ticker(df: pd.DataFrame, params: Dict) -> Optional[Dict
 
     # MA20 保護：當日 O 或 C >= MA20
     if params["ENABLE_RULE_OC_ABOVE_MA20"]:
-        if not ( (o.iloc[-1] >= ma20.iloc[-1]) or (c.iloc[-1] >= ma20.iloc[-1]) ):
+        if not ((o.iloc[-1] >= ma20.iloc[-1]) or (c.iloc[-1] >= ma20.iloc[-1])):
             return None
 
     # MA10 穩健度：近5日，收盤 < MA10 的天數 <= 門檻
@@ -337,7 +333,7 @@ def evaluate_signals_for_ticker(df: pd.DataFrame, params: Dict) -> Optional[Dict
         close=float(c.iloc[-1]),
         K=float(K.iloc[-1]) if pd.notna(K.iloc[-1]) else np.nan,
         D=float(D.iloc[-1]) if pd.notna(D.iloc[-1]) else np.nan,
-        k_d_spread=float(K.iloc[-1] - D.iloc[-1]) if pd.notna(K.iloc[-1]) and pd.notna(D.iloc[-1]) else np.nan,
+        k_d_spread=float(K.iloc[-1] - D.iloc[-1]) if (pd.notna(K.iloc[-1]) and pd.notna(D.iloc[-1])) else np.nan,
         vol_ratio=float(vol_ratio),
         ma20=float(ma20.iloc[-1]),
         trend_strength=float((c.iloc[-1] - ma20.iloc[-1]) / ma20.iloc[-1]) if (pd.notna(ma20.iloc[-1]) and ma20.iloc[-1] != 0) else np.nan,
@@ -410,21 +406,16 @@ def run_once():
             logger.warning(f"Signal evaluation failed for {ysym}: {e}")
 
     today = today_str_tpe()
-
-    # 預先準備輸出路徑
     out_name = f"picks_{today}.csv"
     out_path = OUTPUT_DIR / out_name
     hist_path = HISTORY_DIR / out_name
 
     if not prelim_rows:
         logger.info("No candidates after pre-screen. Saving empty CSV and notifying...")
-
         empty_cols = ["date","code","name","close","K","D","vol_ratio","cross_day","market_cap",
                       "k_d_spread","trend_strength","rank_k","rank_v","a","b","score","streak_days"]
-
         pd.DataFrame(columns=empty_cols).to_csv(out_path, index=False, encoding="utf-8-sig")
         pd.DataFrame(columns=empty_cols).to_csv(hist_path, index=False, encoding="utf-8-sig")
-
         bot, chat = params.get("TELEGRAM_BOT_TOKEN"), params.get("TELEGRAM_CHAT_ID")
         if bot and chat:
             try:
@@ -444,13 +435,10 @@ def run_once():
 
     if df_cand.empty:
         logger.info("No candidates after market cap filter. Saving empty CSV and notifying...")
-
         empty_cols = ["date","code","name","close","K","D","vol_ratio","cross_day","market_cap",
                       "k_d_spread","trend_strength","rank_k","rank_v","a","b","score","streak_days"]
-
         pd.DataFrame(columns=empty_cols).to_csv(out_path, index=False, encoding="utf-8-sig")
         pd.DataFrame(columns=empty_cols).to_csv(hist_path, index=False, encoding="utf-8-sig")
-
         bot, chat = params.get("TELEGRAM_BOT_TOKEN"), params.get("TELEGRAM_CHAT_ID")
         if bot and chat:
             try:
