@@ -1,9 +1,10 @@
 name: TWSE-TPEX KD Screener
 
 on:
-  workflow_dispatch:        # 這行讓你能在 Actions 介面手動執行
+  workflow_dispatch:        # 手動執行
   schedule:
-    - cron: "5 6 * * 1-5"   # 台北 14:05
+    # GitHub Actions 使用 UTC。台北 13:40 = UTC 05:40
+    - cron: "40 5 * * 1-5"
 
 jobs:
   run:
@@ -90,5 +91,6 @@ jobs:
           name: screener-artifacts
           path: |
             output/*.csv
+            history/*.csv
             logs/*
           if-no-files-found: warn
