@@ -42,6 +42,7 @@ LOG_DIR = ROOT / "logs"
 HISTORY_DIR = ROOT / "history"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+HISTORY_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -113,11 +114,14 @@ def today_str_tpe() -> str:
 
 def is_non_trading_today() -> bool:
     """
-    用 0050.TW 判斷是否有今日日K。收盤前執行通常無今日K，會判非交易日。
+    用 0050.TW 判斷是否有今日日K。
+    但若台北時間 >= 13:35 且為周一~周五，即使 Yahoo 尚未更新日K，仍視為交易日以避免 13:40 誤判。
     """
     try:
         tz = pytz.timezone("Asia/Taipei")
-        today_tpe = datetime.now(tz).date()
+        now_tpe = datetime.now(tz)
+        today_tpe = now_tpe.date()
+
         m = download_ohlcv_batches(
             tickers=["0050.TW"],
             period="1mo",
@@ -128,12 +132,24 @@ def is_non_trading_today() -> bool:
         )
         df = m.get("0050.TW")
         if df is None or df.empty:
+            # 若資料取不到，13:35 後的平日視為交易日，其他時間保守視為非交易日
+            if now_tpe.weekday() < 5 and (now_tpe.hour * 60 + now_tpe.minute) >= (13 * 60 + 35):
+                return False
             return True
+
         last_date = pd.to_datetime(df.index[-1]).date()
-        return last_date != today_tpe
+        if last_date == today_tpe:
+            return False
+
+        # 尚無今日日K，但若已過 13:35 且為平日，當作交易日
+        if now_tpe.weekday() < 5 and (now_tpe.hour * 60 + now_tpe.minute) >= (13 * 60 + 35):
+            return False
+
+        return True
     except Exception as e:
         logger.warning(f"Trading-day check failed: {e}")
-        return False  # 檢查失敗時當交易日處理，避免誤判
+        # 檢查失敗時，以交易日處理（不阻擋流程）
+        return False
 
 
 def build_universe(params: Dict) -> pd.DataFrame:
@@ -209,21 +225,15 @@ def liquidity_10d_ok(volume: pd.Series, min_share: int) -> bool:
     return bool((last10 >= min_share).all())
 
 
-def compute_streak_days(code: str, today: datetime.date, lookback_days: int = 14) -> int:
-    """
-    計算「連續出現天數」：含今天。
-    逐日回看 picks_YYYYMMDD.csv，直到缺檔或未出現即中斷。
-    """
-from datetime import datetime, timedelta
-
+# ---------- 連續出現天數（含今天），從 output/ 與 history/ 倒查 ----------
 def _find_pick_file_by_date(dte: datetime.date) -> Optional[Path]:
     fname = f"picks_{dte.strftime('%Y%m%d')}.csv"
-    # 先找 output，再找 history
     for base in (OUTPUT_DIR, HISTORY_DIR):
         p = base / fname
         if p.exists():
             return p
     return None
+
 
 def compute_streak_days(code: str, today: datetime.date, lookback_days: int = 14) -> int:
     streak = 1
@@ -292,7 +302,7 @@ def evaluate_signals_for_ticker(df: pd.DataFrame, params: Dict) -> Optional[Dict
     if not vol_ok:
         return None
 
-    # 10日流動性：最近10日每日成交量皆 >= 100萬股
+    # 10日流動性：最近10日每日成交量皆 >= 門檻
     if not liquidity_10d_ok(v, params["MIN_DAILY_VOLUME_10D"]):
         return None
 
@@ -330,7 +340,7 @@ def evaluate_signals_for_ticker(df: pd.DataFrame, params: Dict) -> Optional[Dict
         k_d_spread=float(K.iloc[-1] - D.iloc[-1]) if pd.notna(K.iloc[-1]) and pd.notna(D.iloc[-1]) else np.nan,
         vol_ratio=float(vol_ratio),
         ma20=float(ma20.iloc[-1]),
-        trend_strength=float((c.iloc[-1] - ma20.iloc[-1]) / ma20.iloc[-1]) if ma20.iloc[-1] and not np.isnan(ma20.iloc[-1]) else np.nan,
+        trend_strength=float((c.iloc[-1] - ma20.iloc[-1]) / ma20.iloc[-1]) if (pd.notna(ma20.iloc[-1]) and ma20.iloc[-1] != 0) else np.nan,
         cross_day=pd.to_datetime(df.index[cross_idx]).date().isoformat()
     )
 
@@ -350,7 +360,7 @@ def format_summary_line(code: str, name: str, r: pd.Series, with_streak_icon: bo
 def run_once():
     params = get_env_params()
 
-    # 非交易日
+    # 非交易日判定（含 13:35 例外處理）
     if is_non_trading_today():
         msg = "今日為非交易日，請開心過好每一天"
         bot, chat = params.get("TELEGRAM_BOT_TOKEN"), params.get("TELEGRAM_CHAT_ID")
@@ -401,12 +411,20 @@ def run_once():
 
     today = today_str_tpe()
 
+    # 預先準備輸出路徑
+    out_name = f"picks_{today}.csv"
+    out_path = OUTPUT_DIR / out_name
+    hist_path = HISTORY_DIR / out_name
+
     if not prelim_rows:
         logger.info("No candidates after pre-screen. Saving empty CSV and notifying...")
-        out_path = OUTPUT_DIR / f"picks_{today}.csv"
-        pd.DataFrame(columns=["date","code","name","close","K","D","vol_ratio","cross_day","market_cap",
-                              "k_d_spread","trend_strength","rank_k","rank_v","a","b","score","streak_days"]
-                     ).to_csv(out_path, index=False, encoding="utf-8-sig")
+
+        empty_cols = ["date","code","name","close","K","D","vol_ratio","cross_day","market_cap",
+                      "k_d_spread","trend_strength","rank_k","rank_v","a","b","score","streak_days"]
+
+        pd.DataFrame(columns=empty_cols).to_csv(out_path, index=False, encoding="utf-8-sig")
+        pd.DataFrame(columns=empty_cols).to_csv(hist_path, index=False, encoding="utf-8-sig")
+
         bot, chat = params.get("TELEGRAM_BOT_TOKEN"), params.get("TELEGRAM_CHAT_ID")
         if bot and chat:
             try:
@@ -426,10 +444,13 @@ def run_once():
 
     if df_cand.empty:
         logger.info("No candidates after market cap filter. Saving empty CSV and notifying...")
-        out_path = OUTPUT_DIR / f"picks_{today}.csv"
-        pd.DataFrame(columns=["date","code","name","close","K","D","vol_ratio","cross_day","market_cap",
-                              "k_d_spread","trend_strength","rank_k","rank_v","a","b","score","streak_days"]
-                     ).to_csv(out_path, index=False, encoding="utf-8-sig")
+
+        empty_cols = ["date","code","name","close","K","D","vol_ratio","cross_day","market_cap",
+                      "k_d_spread","trend_strength","rank_k","rank_v","a","b","score","streak_days"]
+
+        pd.DataFrame(columns=empty_cols).to_csv(out_path, index=False, encoding="utf-8-sig")
+        pd.DataFrame(columns=empty_cols).to_csv(hist_path, index=False, encoding="utf-8-sig")
+
         bot, chat = params.get("TELEGRAM_BOT_TOKEN"), params.get("TELEGRAM_CHAT_ID")
         if bot and chat:
             try:
@@ -455,14 +476,14 @@ def run_once():
     topn = max(1, int(params["TOP_N"]))
     df_out = df_cand.head(topn).copy()
 
-    # 存檔（單一 CSV 保留）
-    out_path = OUTPUT_DIR / f"picks_{today}.csv"
+    # 存檔：同時寫到 output/ 與 history/
     cols = ["date","code","name","close","K","D","vol_ratio","cross_day","market_cap",
             "k_d_spread","trend_strength","rank_k","rank_v","a","b","score","streak_days"]
     df_out.to_csv(out_path, index=False, encoding="utf-8-sig")
-    logger.info(f"Saved results to {out_path} (count={len(df_out)})")
+    df_out.to_csv(hist_path, index=False, encoding="utf-8-sig")
+    logger.info(f"Saved results to {out_path} and {hist_path} (count={len(df_out)})")
 
-    # ===== Telegram：分成兩個表區塊 =====
+    # ===== Telegram：分成兩個表區塊（≥2日 vs 1日）=====
     bot, chat = params.get("TELEGRAM_BOT_TOKEN"), params.get("TELEGRAM_CHAT_ID")
     if bot and chat:
         try:
@@ -470,31 +491,28 @@ def run_once():
                 text = f"[KD Screener] {today} 今日無符合條件之個股。"
             else:
                 header = f"[TWSE/TPEX KD Screener] {today} 前{len(df_out)}名（依 score）"
-                df_hot = df_out[df_out["streak_days"] >= 2].copy()
-                df_new = df_out[df_out["streak_days"] < 2].copy()
+                df_ge2 = df_out[df_out["streak_days"] >= 2].copy()
+                df_eq1 = df_out[df_out["streak_days"] == 1].copy()
 
                 lines = [header]
 
-                # 表一：連續出現（>=2日）
-                if not df_hot.empty:
-                    lines.append("")
+                # 表一：連續出現（≥2日）
+                lines.append("")
+                if not df_ge2.empty:
                     lines.append("🔥 連續出現（≥2日）")
-                    for _, r in df_hot.iterrows():
+                    for _, r in df_ge2.iterrows():
                         lines.append(" - " + format_summary_line(str(r["code"]), str(r["name"]), r, with_streak_icon=True))
                 else:
-                    lines.append("")
                     lines.append("🔥 連續出現（≥2日）：無")
 
-                # 表二：非連續（今日首次或中斷）
-                if not df_new.empty:
-                    lines.append("")
-                    lines.append("— 非連續（今日首次或中斷） —")
-                    for _, r in df_new.iterrows():
-                        # 非連續段不顯示🔥標籤
+                # 表二：連續出現（1日）
+                lines.append("")
+                if not df_eq1.empty:
+                    lines.append("連續出現（1日）")
+                    for _, r in df_eq1.iterrows():
                         lines.append(" - " + format_summary_line(str(r["code"]), str(r["name"]), r, with_streak_icon=False))
                 else:
-                    lines.append("")
-                    lines.append("— 非連續（今日首次或中斷） — 無")
+                    lines.append("連續出現（1日）：無")
 
                 text = "\n".join(lines)
 
